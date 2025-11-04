@@ -101,12 +101,12 @@ class CustomLinear(nn.Linear):
         self.lora_diffs = []
         for i, diff in enumerate(lora_diffs):
             if len(diff) > 1:
-                self.register_buffer(f"lora_diff_{i}_0", diff[0].to(device))
-                self.register_buffer(f"lora_diff_{i}_1", diff[1].to(device))
+                self.register_buffer(f"lora_diff_{i}_0", diff[0].to(device, self.compute_dtype))
+                self.register_buffer(f"lora_diff_{i}_1", diff[1].to(device, self.compute_dtype))
                 setattr(self, f"lora_diff_{i}_2", diff[2])
                 self.lora_diffs.append((f"lora_diff_{i}_0", f"lora_diff_{i}_1", f"lora_diff_{i}_2"))
             else:
-                self.register_buffer(f"lora_diff_{i}_0", diff[0].to(device))
+                self.register_buffer(f"lora_diff_{i}_0", diff[0].to(device, self.compute_dtype))
                 self.lora_diffs.append(f"lora_diff_{i}_0")
 
     def _get_weight_with_lora(self, weight):
