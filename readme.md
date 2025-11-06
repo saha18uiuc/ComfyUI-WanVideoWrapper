@@ -1,3 +1,5 @@
+# ComfyUI wrapper nodes for [WanVideo](https://github.com/Wan-Video/Wan2.1) and related models.
+
 ## Update notification that can affect memory use in old workflows
 
 In a recent update I changed how unmerged LoRA weights are handled:
@@ -21,8 +23,6 @@ To clear your Triton cache you can delete the contents of following (default) fo
 
 
 ## Note: Due to the stupid amount of bots or people thinking this is some of video generation service, I've blocked new accounts from posting issues for now.
-
-# ComfyUI wrapper nodes for [WanVideo](https://github.com/Wan-Video/Wan2.1) and related models.
 
 # WORK IN PROGRESS (perpetually)
 
