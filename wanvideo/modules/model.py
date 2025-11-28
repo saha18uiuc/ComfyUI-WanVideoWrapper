@@ -2364,7 +2364,7 @@ class WanModel(torch.nn.Module):
             ref_x = [self.patch_embedding(r.unsqueeze(0).float()).to(self.base_dtype) for r in ref_x]
             ref_c = [self.patch_embedding_ref_c(r[:16].unsqueeze(0).float()).to(self.base_dtype) for r in ref_c]
             F += ref_x[0].shape[2] + ref_c[0].shape[2] # update frame count for rope
-            x = [torch.cat([r, u * sdancer_input["ref_strength"], v * sdancer_input["ref_strength"]], dim=2) for r, u, v in zip(x, ref_x, ref_c)]
+            x = [torch.cat([r, u, v], dim=2) for r, u, v in zip(x, ref_x, ref_c)]
             seq_len = torch.tensor([u.flatten(2).transpose(1, 2).size(1) for u in x], dtype=torch.int32).max() # update seq len
 
         # grid sizes and seq len

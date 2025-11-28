@@ -21,7 +21,6 @@ class WanVideoAddSteadyDancerEmbeds:
         return {"required": {
                     "embeds": ("WANVIDIMAGE_EMBEDS",),
                     "pose_latents_positive": ("LATENT",),
-                    "ref_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 100.0, "step": 0.01, "tooltip": "Strength of the portrait embedding"}),
                     "pose_strength_spatial": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 100.0, "step": 0.01, "tooltip": "Strength of the pose embedding"}),
                     "pose_strength_temporal": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 100.0, "step": 0.01, "tooltip": "Strength of the pose embedding"}),
                     "start_percent": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Start percentage of the embedding application"}),
@@ -39,11 +38,10 @@ class WanVideoAddSteadyDancerEmbeds:
     FUNCTION = "add"
     CATEGORY = "WanVideoWrapper"
 
-    def add(self, embeds, pose_latents_positive, pose_strength_spatial, pose_strength_temporal, ref_strength, start_percent=0.0, end_percent=1.0, pose_latents_negative=None, clip_vision_embeds=None):
+    def add(self, embeds, pose_latents_positive, pose_strength_spatial, pose_strength_temporal, start_percent=0.0, end_percent=1.0, pose_latents_negative=None, clip_vision_embeds=None):
         sdance_embeds = {
             "cond_pos": pose_latents_positive["samples"][0],
             "cond_neg": pose_latents_negative["samples"][0] if pose_latents_negative else None,
-            "ref_strength": ref_strength,
             "pose_strength_spatial": pose_strength_spatial,
             "pose_strength_temporal": pose_strength_temporal,
             "start_percent": start_percent,
