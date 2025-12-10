@@ -1011,6 +1011,7 @@ class WanVideoModelLoader:
                     "radial_sage_attention",
                     "sageattn_compiled",
                     "sageattn_ultravico",
+                    "comfy"
                     ], {"default": "sdpa"}),
                 "compile_args": ("WANCOMPILEARGS", ),
                 "block_swap_args": ("BLOCKSWAPARGS", ),

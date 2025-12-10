@@ -1,6 +1,8 @@
 import torch
 from ...utils import log
 
+from comfy.ldm.modules.attention import optimized_attention
+
 def attention_func_error(*args, **kwargs):
     raise ImportError("Selected attention mode not available. Please ensure required packages are installed correctly.")
 
@@ -92,7 +94,7 @@ except:
 
 def attention(q, k, v, q_lens=None, k_lens=None, max_seqlen_q=None, max_seqlen_k=None, dropout_p=0.,
     softmax_scale=None, q_scale=None, causal=False,  window_size=(-1, -1), deterministic=False, dtype=torch.bfloat16,
-    attention_mode='sdpa', attn_mask=None, multi_factor=0.9):
+    attention_mode='sdpa', attn_mask=None, multi_factor=0.9, heads=128):
     if "flash" in attention_mode:
         return flash_attention(q, k, v, q_lens=q_lens, k_lens=k_lens, dropout_p=dropout_p, softmax_scale=softmax_scale,
             q_scale=q_scale, causal=causal, window_size=window_size, deterministic=deterministic, dtype=dtype, version=2 if attention_mode == 'flash_attn_2' else 3,
@@ -107,6 +109,8 @@ def attention(q, k, v, q_lens=None, k_lens=None, max_seqlen_q=None, max_seqlen_k
         return sageattn_func(q, k, v, tensor_layout="NHD").contiguous()
     elif attention_mode == 'sageattn_ultravico':
         return sageattn_func_ultravico([q, k, v], multi_factor=multi_factor).contiguous()
+    elif attention_mode == 'comfy':
+        return optimized_attention(q.transpose(1,2), k.transpose(1,2), v.transpose(1,2), heads=heads, skip_reshape=True)
     else: # sdpa
         if not (q.dtype == k.dtype == v.dtype):
             return torch.nn.functional.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2).to(q.dtype), v.transpose(1, 2).to(q.dtype), attn_mask=attn_mask).transpose(1, 2).contiguous()
