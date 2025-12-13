@@ -1056,6 +1056,8 @@ class WanVideoSampler:
 
         freqs = None
 
+        log.info(f"Rope function: {rope_function}")
+
         riflex_freq_index = 0 if riflex_freq_index is None else riflex_freq_index
         transformer.rope_embedder.k = None
         transformer.rope_embedder.num_frames = None
@@ -1063,7 +1065,7 @@ class WanVideoSampler:
 
         if mocha_embeds is not None:
             from .mocha.nodes import rope_params_mocha
-            log.info(f"Using Mocha RoPE")
+            log.info("Using Mocha RoPE")
             rope_function = 'mocha'
 
             freqs = torch.cat([
@@ -3335,6 +3337,8 @@ class WanVideoSamplerv2(WanVideoSampler):
 
         if extra_args is not None:
             args_dict.update(extra_args)
+        else:
+            args_dict["rope_function"] = "comfy"
 
         return super().process(**args_dict)
 
