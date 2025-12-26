@@ -1379,7 +1379,6 @@ class WanVideoSampler:
                     z = z * c_in
                     timestep = c_noise
 
-                self.noise_front_pad_num = 0
                 if image_cond is not None:
                     self.noise_front_pad_num = image_cond_input.shape[1] - z.shape[1]
                     if self.noise_front_pad_num > 0:
@@ -1771,6 +1770,8 @@ class WanVideoSampler:
                         latent_flipped = torch.flip(latent, dims=[1])
                         latent_model_input_flipped = latent_flipped.to(device)
 
+                    self.noise_front_pad_num = 0
+
                     #InfiniteTalk first frame handling
                     if (extra_latents is not None
                         and not multitalk_sampling
@@ -1821,7 +1822,7 @@ class WanVideoSampler:
                     if feta_args is not None and feta_start_percent <= current_step_percentage <= feta_end_percent:
                         enhance_enabled = True
                     #region context windowing
-                    elif context_options is not None:
+                    if context_options is not None:
                         counter = torch.zeros_like(latent_model_input, device=device)
                         noise_pred = torch.zeros_like(latent_model_input, device=device)
                         context_queue = list(context(idx, steps, latent_video_length, context_frames, context_stride, context_overlap))
