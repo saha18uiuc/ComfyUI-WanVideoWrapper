@@ -2187,7 +2187,7 @@ class WanModel(torch.nn.Module):
 
     def rope_encode_comfy(self, t, h, w, freq_offset=0, t_start=0, ref_frame_shape=None, pose_frame_shape=None,
                           steps_t=None, steps_h=None, steps_w=None, ntk_alphas=[1,1,1], device=None, dtype=None,
-                          ref_frame_index=10, longcat_num_ref_latents=None):
+                          ref_frame_index=10, longcat_num_ref_latents=0):
 
         patch_size = self.patch_size
         t_len = ((t + (patch_size[0] // 2)) // patch_size[0])
