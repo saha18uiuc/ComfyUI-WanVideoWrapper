@@ -1052,7 +1052,7 @@ class WanVideoUltraVicoSettings:
         return {
             "required": {
                 "model": ("WANVIDEOMODEL", ),
-                "alpha": ("FLOAT", {"default": 0.9, "min": 0.0, "max": 1.0, "step": 0.001}),
+                "alpha": ("FLOAT", {"default": 0.9, "min": 0.0, "max": 1.0, "step": 0.001, "tooltip": "Alpha value for the decay, higher values mean slower decay"}),
             },
         }
 
@@ -1060,7 +1060,7 @@ class WanVideoUltraVicoSettings:
     RETURN_NAMES = ("model", )
     FUNCTION = "getmodelpath"
     CATEGORY = "WanVideoWrapper"
-    DESCRIPTION = "Override the attention mode for the model for specific step and/or block range"
+    DESCRIPTION = "Set UltraVico parameters, attention mode still needs to be set to sageattn_ultravico, https://github.com/thu-ml/DiT-Extrapolation"
 
     def getmodelpath(self, model, alpha):
         model_clone = model.clone()
