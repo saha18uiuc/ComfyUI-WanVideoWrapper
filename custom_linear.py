@@ -2,7 +2,14 @@ import torch
 import torch.nn as nn
 from accelerate import init_empty_weights
 from .gguf.gguf_utils import GGUFParameter, dequantize_gguf_tensor
-from .lora_kernels import grouped_lora_available, grouped_lora_forward
+try:
+    from .wanvideo.lora_kernels import grouped_lora_available, grouped_lora_forward
+except Exception:
+    def grouped_lora_available():
+        return False
+
+    def grouped_lora_forward(*args, **kwargs):
+        raise RuntimeError("Grouped LoRA kernel unavailable (missing dependencies).")
 
 @torch.library.custom_op("wanvideo::apply_lora", mutates_args=())
 def apply_lora(weight: torch.Tensor, lora_diff_0: torch.Tensor, lora_diff_1: torch.Tensor, lora_diff_2: float, lora_strength: torch.Tensor) -> torch.Tensor:
