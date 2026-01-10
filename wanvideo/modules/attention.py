@@ -2,6 +2,7 @@ import torch
 from ...utils import log
 
 from comfy.ldm.modules.attention import optimized_attention
+from .attention_backend import attention as backend_attention
 
 def attention_func_error(*args, **kwargs):
     raise ImportError("Selected attention mode not available. Please ensure required packages are installed correctly.")
@@ -112,6 +113,16 @@ def attention(q, k, v, q_lens=None, k_lens=None, max_seqlen_q=None, max_seqlen_k
     elif attention_mode == 'comfy':
         return optimized_attention(q.transpose(1,2), k.transpose(1,2), v.transpose(1,2), heads=heads, skip_reshape=True)
     else: # sdpa
-        if not (q.dtype == k.dtype == v.dtype):
-            return torch.nn.functional.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2).to(q.dtype), v.transpose(1, 2).to(q.dtype), attn_mask=attn_mask).transpose(1, 2).contiguous()
-        return torch.nn.functional.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), attn_mask=attn_mask).transpose(1, 2).contiguous()
+        backend = "auto"
+        if transformer_options is not None:
+            backend = transformer_options.get("attention_backend", backend)
+        q_t = q.transpose(1, 2)
+        k_t = k.transpose(1, 2)
+        v_t = v.transpose(1, 2)
+        output = backend_attention(
+            q_t, k_t, v_t,
+            backend=backend,
+            attn_mask=attn_mask,
+            is_causal=causal,
+        )
+        return output.transpose(1, 2).contiguous()
