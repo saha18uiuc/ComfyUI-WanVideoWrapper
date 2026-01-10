@@ -148,7 +148,10 @@ class WanVideoSampler:
         transformer.lora_scheduling_enabled = transformer_options.get("lora_scheduling_enabled", False)
 
         # torch.compile (block-level when enabled)
-        compile_args = model.get("compile_args", None)
+        try:
+            compile_args = model["compile_args"]
+        except KeyError:
+            compile_args = None
         if compile_args:
             transformer = compile_model(transformer, compile_args)
 
