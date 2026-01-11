@@ -1199,6 +1199,8 @@ class WanVideoSampler:
                 prev_ones = torch.ones(20, *prev_latents.shape[1:], device=device, dtype=dtype)
                 dual_control_input["prev_latent"] = torch.cat([prev_ones, prev_latents]).unsqueeze(0)
 
+        latent_model_input_ovi = None
+
         #region model pred
         graph_runners = {"cond": None, "uncond": None}
         graph_state = {"enabled": False, "blocked_by": []}
