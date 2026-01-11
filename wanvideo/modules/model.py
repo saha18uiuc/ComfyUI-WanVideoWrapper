@@ -3193,7 +3193,9 @@ class WanModel(torch.nn.Module):
             attention_mode_override_active = False
             attention_mode_override = transformer_options.get("attention_mode_override", None)
             if attention_mode_override is not None:
-                attn_override_blocks = attention_mode_override.get("blocks", range(len(self.blocks)))
+                attn_override_blocks = attention_mode_override.get("blocks", None)
+                if attn_override_blocks is None:
+                    attn_override_blocks = range(len(self.blocks))
                 if attention_mode_override["start_step"] <= current_step < attention_mode_override["end_step"]:
                     attention_mode_override_active = True
                     if attention_mode_override["verbose"]:
@@ -3201,7 +3203,7 @@ class WanModel(torch.nn.Module):
 
             for b, block in enumerate(self.blocks):
                 mm.throw_exception_if_processing_interrupted()
-                if attention_mode_override_active and b in attn_override_blocks:
+                if attention_mode_override_active and (attn_override_blocks is None or b in attn_override_blocks):
                     attention_mode = attention_mode_override['mode']
                 else:
                     attention_mode = None
