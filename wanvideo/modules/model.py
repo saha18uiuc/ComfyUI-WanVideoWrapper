@@ -2613,7 +2613,16 @@ class WanModel(torch.nn.Module):
             x = [torch.cat([u, end_ref_latent.unsqueeze(0)], dim=1) for end_ref_latent, u in zip(end_ref_latent, x)]
 
 
-        x = torch.cat([torch.cat([u, u.new_zeros(1, seq_len - u.size(1), u.size(2))], dim=1) for u in x])
+        batch = len(x)
+        if batch > 0:
+            feature_dim = x[0].size(2)
+            padded = x[0].new_zeros(batch, seq_len, feature_dim)
+            for idx, u in enumerate(x):
+                length = u.size(1)
+                padded[idx, :length].copy_(u.squeeze(0))
+            x = padded
+        else:
+            x = self.original_patch_embedding.weight.new_zeros((0, seq_len, self.original_patch_embedding.weight.shape[0]))
 
         if self.trainable_cond_mask is not None:
             x = x + cond_mask_weight[0]
