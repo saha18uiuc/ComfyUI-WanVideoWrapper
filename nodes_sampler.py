@@ -1996,7 +1996,7 @@ class WanVideoSampler:
                     #batched
                     else:
                         base_params.pop('is_uncond', None)
-                        base_params['z'] = [z] * 2
+                        base_params['x'] = [z] * 2
                         base_params['y'] = [image_cond_input] * 2 if image_cond_input is not None else None
                         base_params['clip_fea'] = torch.cat([clip_fea, clip_fea], dim=0)
                         cache_state_uncond = None
