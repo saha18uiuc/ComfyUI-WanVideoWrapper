@@ -177,6 +177,9 @@ class WanVideoSampler:
         if force_sdpa_attention:
             _disable_xformers_for_graphs(force=True)
         force_batched_cfg = transformer_options.get("force_batched_cfg", False) or WAN_FORCE_BATCHED_CFG
+        if force_batched_cfg and (multitalk_embeds is not None or fantasytalking_embeds is not None):
+            log.warning("Batched CFG disabled because audio-guided modes require separate passes.")
+            force_batched_cfg = False
         transformer_options["force_batched_cfg"] = force_batched_cfg
         if force_batched_cfg and slg_args is not None:
             log.warning("Force batched CFG requested but SLG arguments present; falling back to sequential CFG.")
