@@ -43,6 +43,7 @@ PATCH_SIZE = (1, 2, 2)
 
 WAN_KEEP_XFORMERS = os.environ.get("WAN_KEEP_XFORMERS", "").strip().lower() in ("1", "true", "yes")
 WAN_FORCE_SDPA = os.environ.get("WAN_FORCE_SDPA", "").strip().lower() in ("1", "true", "yes")
+WAN_FORCE_BATCHED_CFG = os.environ.get("WAN_FORCE_BATCHED_CFG", "").strip().lower() in ("1", "true", "yes")
 _XFORMERS_DISABLED_GLOBALLY = False
 
 
@@ -175,6 +176,14 @@ class WanVideoSampler:
         transformer_options["force_sdpa_attention"] = force_sdpa_attention
         if force_sdpa_attention:
             _disable_xformers_for_graphs(force=True)
+        force_batched_cfg = transformer_options.get("force_batched_cfg", False) or WAN_FORCE_BATCHED_CFG
+        transformer_options["force_batched_cfg"] = force_batched_cfg
+        if force_batched_cfg and slg_args is not None:
+            log.warning("Force batched CFG requested but SLG arguments present; falling back to sequential CFG.")
+            force_batched_cfg = False
+        if force_batched_cfg:
+            batched_cfg = True
+            log.info("Batched CFG enabled (forced) to halve transformer passes per step.")
         merge_loras = transformer_options["merge_loras"]
         use_cuda_graphs = transformer_options.get("enable_cuda_graphs", False)
         env_force_cuda_graphs = os.environ.get("WAN_FORCE_CUDA_GRAPHS", "").strip().lower() in ("1", "true", "yes")
