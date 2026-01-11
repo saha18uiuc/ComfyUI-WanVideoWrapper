@@ -1,5 +1,13 @@
 import torch
 import torch.nn.functional as F
+from contextlib import contextmanager
+
+try:
+    from torch.nn.attention import sdpa_kernel as torch_sdpa_kernel
+    from torch.nn.attention import SDPBackend
+except Exception:
+    torch_sdpa_kernel = None
+    SDPBackend = None
 
 
 def _match_dtype(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
@@ -15,29 +23,54 @@ def _scaled_attention(q, k, v, attn_mask=None, is_causal=False):
     return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, is_causal=is_causal)
 
 
+@contextmanager
+def _sdpa_context(preferred_backends, *, fallback_flash=False, fallback_mem=False):
+    if torch_sdpa_kernel is not None and SDPBackend is not None:
+        backend_objs = []
+        for name in preferred_backends:
+            backend = getattr(SDPBackend, name, None)
+            if backend is not None:
+                backend_objs.append(backend)
+        if backend_objs:
+            with torch_sdpa_kernel(backend_objs):
+                yield
+                return
+    ctx = getattr(torch.backends, "cuda", None)
+    sdp_ctx = getattr(ctx, "sdp_kernel", None)
+    if callable(sdp_ctx):
+        with sdp_ctx(
+            enable_flash=fallback_flash,
+            enable_mem_efficient=fallback_mem,
+            enable_math=False,
+        ):
+            yield
+            return
+    yield
+
+
 def sdpa_flash(q, k, v, attn_mask=None, is_causal=False):
     """Force PyTorch SDPA to use flash or mem-efficient kernels."""
     if not (q.is_cuda and torch.cuda.is_available()):
         return _scaled_attention(q, k, v, attn_mask=attn_mask, is_causal=is_causal)
     q, k, v = _match_dtype(q, k, v)
-    ctx = getattr(torch.backends, "cuda", None)
-    kernel = getattr(ctx, "sdp_kernel", None)
-    if callable(kernel):
-        with kernel(enable_flash=True, enable_mem_efficient=True, enable_math=False):
-            return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, is_causal=is_causal)
-    return _scaled_attention(q, k, v, attn_mask=attn_mask, is_causal=is_causal)
+    with _sdpa_context(
+        preferred_backends=["FLASH_ATTENTION", "EFFICIENT_ATTENTION", "MATH"],
+        fallback_flash=True,
+        fallback_mem=True,
+    ):
+        return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, is_causal=is_causal)
 
 
 def sdpa_mem_efficient(q, k, v, attn_mask=None, is_causal=False):
     if not (q.is_cuda and torch.cuda.is_available()):
         return _scaled_attention(q, k, v, attn_mask=attn_mask, is_causal=is_causal)
     q, k, v = _match_dtype(q, k, v)
-    ctx = getattr(torch.backends, "cuda", None)
-    kernel = getattr(ctx, "sdp_kernel", None)
-    if callable(kernel):
-        with kernel(enable_flash=False, enable_mem_efficient=True, enable_math=False):
-            return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, is_causal=is_causal)
-    return _scaled_attention(q, k, v, attn_mask=attn_mask, is_causal=is_causal)
+    with _sdpa_context(
+        preferred_backends=["EFFICIENT_ATTENTION", "MATH"],
+        fallback_flash=False,
+        fallback_mem=True,
+    ):
+        return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, is_causal=is_causal)
 
 
 def attention(q, k, v, *, backend="auto", attn_mask=None, is_causal=False):

@@ -41,6 +41,67 @@ rope_functions = ["default", "comfy", "comfy_chunked"]
 VAE_STRIDE = (4, 8, 8)
 PATCH_SIZE = (1, 2, 2)
 
+WAN_KEEP_XFORMERS = os.environ.get("WAN_KEEP_XFORMERS", "").strip().lower() in ("1", "true", "yes")
+_XFORMERS_DISABLED_GLOBALLY = False
+
+
+def _get_xformers_state():
+    getter = getattr(mm, "xformers_enabled", None)
+    if callable(getter):
+        try:
+            return getter()
+        except Exception:
+            pass
+    if hasattr(mm, "use_xformers"):
+        try:
+            return bool(mm.use_xformers)
+        except Exception:
+            pass
+    if hasattr(mm, "XFORMERS_ENABLED"):
+        try:
+            return bool(mm.XFORMERS_ENABLED)
+        except Exception:
+            pass
+    return None
+
+
+def _set_xformers_state(enabled: bool):
+    setter = getattr(mm, "set_use_xformers", None)
+    if callable(setter):
+        try:
+            setter(enabled)
+            return True
+        except Exception:
+            pass
+    if hasattr(mm, "use_xformers"):
+        try:
+            mm.use_xformers = enabled
+            return True
+        except Exception:
+            pass
+    if hasattr(mm, "XFORMERS_ENABLED"):
+        try:
+            mm.XFORMERS_ENABLED = enabled
+            return True
+        except Exception:
+            pass
+    return False
+
+
+def _disable_xformers_for_graphs():
+    global _XFORMERS_DISABLED_GLOBALLY
+    if WAN_KEEP_XFORMERS or _XFORMERS_DISABLED_GLOBALLY:
+        return False
+    current_state = _get_xformers_state()
+    if current_state is False:
+        _XFORMERS_DISABLED_GLOBALLY = True
+        return True
+    if _set_xformers_state(False):
+        _XFORMERS_DISABLED_GLOBALLY = True
+        log.info("Disabled xformers attention to keep CUDA graphs capture-compatible.")
+        return True
+    return False
+
 
 class WanVideoSampler:
     @classmethod
@@ -1321,6 +1382,8 @@ class WanVideoSampler:
         )
         if graph_state["enabled"]:
             log.info("CUDA graphs active for WanVideo transformer.")
+            if transformer_options.get("disable_xformers_for_graphs", True):
+                _disable_xformers_for_graphs()
         if scheduler_graph_enabled:
             log.info("CUDA graphs active for scheduler step.")
 
