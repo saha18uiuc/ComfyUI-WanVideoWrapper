@@ -28,6 +28,14 @@ script_directory = os.path.dirname(os.path.abspath(__file__))
 device = mm.get_torch_device()
 offload_device = mm.unet_offload_device()
 
+try:
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    if hasattr(torch, "set_float32_matmul_precision"):
+        torch.set_float32_matmul_precision("high")
+except Exception:
+    pass
+
 rope_functions = ["default", "comfy", "comfy_chunked"]
 
 VAE_STRIDE = (4, 8, 8)
@@ -103,6 +111,14 @@ class WanVideoSampler:
             transformer_options = {}
         merge_loras = transformer_options["merge_loras"]
         use_cuda_graphs = transformer_options.get("enable_cuda_graphs", False)
+        env_force_cuda_graphs = os.environ.get("WAN_FORCE_CUDA_GRAPHS", "").strip().lower() in ("1", "true", "yes")
+        env_disable_cuda_graphs = os.environ.get("WAN_ENABLE_CUDA_GRAPHS", "").strip().lower() in ("0", "false", "no")
+        if env_disable_cuda_graphs:
+            use_cuda_graphs = False
+        force_cuda_graphs = transformer_options.get("force_cuda_graphs", False) or env_force_cuda_graphs
+        attention_backend_override = transformer_options.get("attention_backend", None)
+        transformer_options["enable_cuda_graphs"] = use_cuda_graphs
+        transformer_options["force_cuda_graphs"] = force_cuda_graphs
 
         block_swap_args = transformer_options.get("block_swap_args", None)
         if block_swap_args is not None:
@@ -951,6 +967,17 @@ class WanVideoSampler:
             use_tsr = experimental_args.get("temporal_score_rescaling", False)
             tsr_k = experimental_args.get("tsr_k", 1.0)
             tsr_sigma = experimental_args.get("tsr_sigma", 1.0)
+            if "enable_cuda_graphs" in experimental_args:
+                use_cuda_graphs = bool(experimental_args["enable_cuda_graphs"])
+            if "force_cuda_graphs" in experimental_args:
+                force_cuda_graphs = bool(experimental_args["force_cuda_graphs"]) or force_cuda_graphs
+            attn_choice = experimental_args.get("attention_backend", None)
+            if attn_choice is not None:
+                transformer_options["attention_backend"] = attn_choice
+                attention_backend_override = attn_choice
+
+        if attention_backend_override:
+            log.info(f"Attention backend set to {attention_backend_override}")
 
         # Rotary positional embeddings (RoPE)
 
@@ -1174,58 +1201,90 @@ class WanVideoSampler:
 
         #region model pred
         graph_runners = {"cond": None, "uncond": None}
-        graph_state = {"enabled": False}
+        graph_state = {"enabled": False, "blocked_by": []}
         scheduler_graph_runner = None
         scheduler_graph_enabled = False
         scheduler_graph_flipped = None
-        if use_cuda_graphs and device.type == "cuda":
-            graph_safe = (
-                cache_args is None
-                and not getattr(transformer, "enable_teacache", False)
-                and not getattr(transformer, "enable_magcache", False)
-                and not getattr(transformer, "enable_easycache", False)
-                and not getattr(transformer, "lora_scheduling_enabled", False)
-                and not control_lora
-                and not multitalk_sampling
-                and loop_args is None
-                and not framepack
-                and not wananimate_loop
-                and transformer.video_attention_split_steps == []
-                and control_latents is None
-                and control_camera_latents is None
-                and recammaster is None
-                and mocha_embeds is None
-                and mtv_input is None
-                and phantom_latents is None
-                and controlnet_latents is None
-                and add_cond is None
-                and minimax_latents is None
-                and multitalk_audio_embeds is None
-                and fantasy_portrait_input is None
-                and unianim_data is None
-                and sdancer_data is None
-                and s2v_audio_input is None
-                and s2v_pose is None
-                and humo_audio is None
-                and wananim_face_pixels is None
-                and wananim_pose_latents is None
-                and uni3c_data is None
-                and latent_model_input_ovi is None
-                and flashvsr_LQ_latent is None
-                and scail_data is None
-                and one_to_all_data is None
-                and wanmove_embeds is None
-            )
-            graph_state["enabled"] = graph_safe
-            scheduler_graph_enabled = (
-                graph_safe
-                and not scheduler_step_args
-                and latents_to_not_step == 0
-                and not clean_latent_indices
-                and not bidirectional_sampling
-                and not is_pusa
-                and not transformer.is_longcat
-            )
+        graph_blockers = [
+            ("cache_args", cache_args is not None),
+            ("teacache", getattr(transformer, "enable_teacache", False)),
+            ("magcache", getattr(transformer, "enable_magcache", False)),
+            ("easycache", getattr(transformer, "enable_easycache", False)),
+            ("lora_scheduling", getattr(transformer, "lora_scheduling_enabled", False)),
+            ("control_lora", control_lora),
+            ("loop_args", loop_args is not None),
+            ("framepack", framepack),
+            ("wananimate_loop", wananimate_loop),
+            ("video_attention_split_steps", transformer.video_attention_split_steps != []),
+            ("control_latents", control_latents is not None),
+            ("control_camera_latents", control_camera_latents is not None),
+            ("recammaster", recammaster is not None),
+            ("mocha_embeds", mocha_embeds is not None),
+            ("mtv_input", mtv_input is not None),
+            ("phantom_latents", phantom_latents is not None),
+            ("controlnet_latents", controlnet_latents is not None),
+            ("add_cond", add_cond is not None),
+            ("minimax_latents", minimax_latents is not None),
+            ("fantasy_portrait_input", fantasy_portrait_input is not None),
+            ("unianim_data", unianim_data is not None),
+            ("sdancer_data", sdancer_data is not None),
+            ("s2v_audio_input", s2v_audio_input is not None),
+            ("s2v_pose", s2v_pose is not None),
+            ("humo_audio", humo_audio is not None),
+            ("wananim_face_pixels", wananim_face_pixels is not None),
+            ("wananim_pose_latents", wananim_pose_latents is not None),
+            ("uni3c_data", uni3c_data is not None),
+            ("latent_model_input_ovi", latent_model_input_ovi is not None),
+            ("flashvsr_LQ_latent", flashvsr_LQ_latent is not None),
+            ("scail_data", scail_data is not None),
+            ("one_to_all_data", one_to_all_data is not None),
+            ("wanmove_embeds", wanmove_embeds is not None),
+        ]
+        blocked_reasons = [name for name, cond in graph_blockers if cond]
+        graph_safe = len(blocked_reasons) == 0
+        if (use_cuda_graphs or force_cuda_graphs) and device.type == "cuda":
+            if not graph_safe and not force_cuda_graphs and blocked_reasons:
+                log.info(f"CUDA graphs disabled due to: {', '.join(blocked_reasons)}")
+            if not graph_safe and force_cuda_graphs and blocked_reasons:
+                log.warning(f"Forcing CUDA graph capture despite: {', '.join(blocked_reasons)}")
+            graph_state["enabled"] = graph_safe or force_cuda_graphs
+            graph_state["blocked_by"] = blocked_reasons
+        else:
+            graph_state["blocked_by"] = blocked_reasons
+            graph_state["enabled"] = False
+
+        scheduler_blockers = [
+            ("latents_to_not_step", latents_to_not_step != 0),
+            ("clean_latent_indices", bool(clean_latent_indices)),
+            ("bidirectional_sampling", bidirectional_sampling),
+            ("is_pusa", is_pusa),
+            ("longcat", getattr(transformer, "is_longcat", False)),
+        ]
+        scheduler_safe = not any(flag for _, flag in scheduler_blockers)
+        scheduler_graph_enabled = (
+            (use_cuda_graphs or force_cuda_graphs)
+            and device.type == "cuda"
+            and (scheduler_safe or force_cuda_graphs)
+        )
+        if graph_state["enabled"]:
+            log.info("CUDA graphs active for WanVideo transformer.")
+        if scheduler_graph_enabled:
+            log.info("CUDA graphs active for scheduler step.")
+
+        def disable_graphs(reason):
+            nonlocal graph_state, graph_runners, scheduler_graph_runner, scheduler_graph_flipped, scheduler_graph_enabled
+            if graph_state["enabled"] or scheduler_graph_enabled:
+                log.warning(f"Disabling CUDA graphs: {reason}")
+            graph_state["enabled"] = False
+            scheduler_graph_enabled = False
+            graph_runners["cond"] = None
+            graph_runners["uncond"] = None
+            scheduler_graph_runner = None
+            scheduler_graph_flipped = None
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
 
         def scheduler_step_runner(noise, timestep_tensor, latent_tensor, flipped=False):
             nonlocal scheduler_graph_runner, scheduler_graph_flipped
@@ -1239,14 +1298,22 @@ class WanVideoSampler:
             ):
                 if scheduler_graph_runner is None:
                     scheduler_graph_runner = SchedulerGraphRunner(runner, scheduler_step_args)
-                return scheduler_graph_runner(noise, timestep_tensor, latent_tensor)
+                try:
+                    return scheduler_graph_runner(noise, timestep_tensor, latent_tensor)
+                except torch.cuda.OutOfMemoryError:
+                    disable_graphs("scheduler graph OOM")
+                    return runner.step(noise, timestep_tensor, latent_tensor, **scheduler_step_args)[0]
             if (
                 scheduler_graph_enabled
                 and flipped
             ):
                 if scheduler_graph_flipped is None:
                     scheduler_graph_flipped = SchedulerGraphRunner(runner, scheduler_step_args)
-                return scheduler_graph_flipped(noise, timestep_tensor, latent_tensor)
+                try:
+                    return scheduler_graph_flipped(noise, timestep_tensor, latent_tensor)
+                except torch.cuda.OutOfMemoryError:
+                    disable_graphs("scheduler graph OOM (flipped)")
+                    return runner.step(noise, timestep_tensor, latent_tensor, **scheduler_step_args)[0]
             return runner.step(noise, timestep_tensor, latent_tensor, **scheduler_step_args)[0]
 
         def predict_with_cfg(z, cfg_scale, positive_embeds, negative_embeds, timestep, idx, image_cond=None, clip_fea=None,
@@ -1274,15 +1341,10 @@ class WanVideoSampler:
                             log.warning("Skipping CUDA graph capture due to low free VRAM.")
                         else:
                             log.warning(f"Disabling CUDA graph ({run_key}) due to: {e}")
-                        graph_state["enabled"] = False
-                        graph_runners["cond"] = None
-                        graph_runners["uncond"] = None
+                        disable_graphs(str(e))
                     except torch.cuda.OutOfMemoryError:
                         log.warning("CUDA graph replay OOM, disabling graphs for this run.")
-                        graph_state["enabled"] = False
-                        graph_runners["cond"] = None
-                        graph_runners["uncond"] = None
-                        torch.cuda.empty_cache()
+                        disable_graphs("graph replay OOM")
                 return transformer(**kwargs)
 
             autocast_enabled = ("fp8" in model["quantization"] and not transformer.patched_linear)

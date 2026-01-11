@@ -1926,7 +1926,8 @@ class WanVideoLoopArgs:
 class WanVideoExperimentalArgs:
     @classmethod
     def INPUT_TYPES(s):
-        return {"required": {
+        return {
+            "required": {
                 "video_attention_split_steps": ("STRING", {"default": "", "tooltip": "Steps to split self attention when using multiple prompts"}),
                 "cfg_zero_star": ("BOOLEAN", {"default": False, "tooltip": "https://github.com/WeichenFan/CFG-Zero-star"}),
                 "use_zero_init": ("BOOLEAN", {"default": False}),
@@ -1941,6 +1942,11 @@ class WanVideoExperimentalArgs:
                 "temporal_score_rescaling": ("BOOLEAN", {"default": False, "tooltip": "Enable temporal score rescaling: https://github.com/temporalscorerescaling/TSR/"}),
                 "tsr_k": ("FLOAT", {"default": 0.95, "min": 0.0, "max": 100.0, "step": 0.01, "tooltip": "The sampling temperature"}),
                 "tsr_sigma": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "How early TSR steer the sampling process"}),
+            },
+            "optional": {
+                "enable_cuda_graphs": ("BOOLEAN", {"default": True, "tooltip": "Explicitly toggle CUDA graph capture during sampling."}),
+                "force_cuda_graphs": ("BOOLEAN", {"default": False, "tooltip": "Force CUDA graphs even when heuristics would normally disable them."}),
+                "attention_backend": (["auto", "sdpa_flash", "sdpa_mem", "math"], {"default": "auto", "tooltip": "Override the attention backend without changing the global attention mode."}),
             },
         }
 
