@@ -1755,6 +1755,13 @@ class WanVideoSampler:
                     else:
                         dual_control_in = dual_control_input
 
+                if graph_state["enabled"]:
+                    dynamic_pipeline = context_window is not None
+                    dynamic_pipeline = dynamic_pipeline or multitalk_audio_input is not None or humo_audio_input is not None
+                    dynamic_pipeline = dynamic_pipeline or dual_control_in is not None or scail_data_in is not None
+                    if dynamic_pipeline:
+                        disable_graphs("variable-length context/audio inputs")
+
                 base_params = {
                     'x': [z], # latent
                     'y': [image_cond_input] if image_cond_input is not None else None, # image cond
