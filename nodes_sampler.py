@@ -2000,7 +2000,8 @@ class WanVideoSampler:
                         base_params['clip_fea'] = torch.cat([clip_fea, clip_fea], dim=0)
                         cache_state_uncond = None
                         batched_outputs = run_transformer_with_graph(
-                            context=positive_embeds + negative_embeds, is_uncond=False,
+                            context=positive_embeds + negative_embeds,
+                            is_uncond=False,
                             pred_id=cache_state[0] if cache_state else None,
                             **base_params
                         )
