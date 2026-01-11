@@ -66,9 +66,10 @@ class GraphDenoiser:
     Requires inputs to keep identical tree structure between invocations.
     """
 
-    def __init__(self, model, warmup_iters=2):
+    def __init__(self, model, warmup_iters=2, memory_factor=2.0):
         self.model = model
         self.warmup_iters = warmup_iters
+        self.memory_factor = memory_factor
         self.graph = None
         self.static_args = None
         self.static_kwargs = None
@@ -115,9 +116,22 @@ class GraphDenoiser:
         if static_obj != new_obj:
             raise ValueError("Non-tensor argument changed between CUDA graph replays.")
 
+    def _estimate_bytes(self, obj):
+        if torch.is_tensor(obj):
+            return obj.nelement() * obj.element_size()
+        if isinstance(obj, (list, tuple)):
+            return sum(self._estimate_bytes(o) for o in obj)
+        if isinstance(obj, dict):
+            return sum(self._estimate_bytes(v) for v in obj.values())
+        return 0
+
     def _capture(self, args, kwargs):
         if not self.enabled:
             raise RuntimeError("CUDA graphs not available on this device.")
+        free_bytes = torch.cuda.mem_get_info()[0]
+        required = self._estimate_bytes(args) + self._estimate_bytes(kwargs)
+        if required == 0 or free_bytes < required * self.memory_factor:
+            raise RuntimeError("graph_insufficient_memory")
         self.static_args = self._clone_structure(args)
         self.static_kwargs = self._clone_structure(kwargs)
         torch.cuda.synchronize()

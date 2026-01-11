@@ -1269,11 +1269,20 @@ class WanVideoSampler:
                         runner = graph_runners[run_key]
                     try:
                         return runner(**kwargs)
-                    except Exception as e:
-                        log.warning(f"Disabling CUDA graph ({run_key}) due to: {e}")
+                    except RuntimeError as e:
+                        if "graph_insufficient_memory" in str(e):
+                            log.warning("Skipping CUDA graph capture due to low free VRAM.")
+                        else:
+                            log.warning(f"Disabling CUDA graph ({run_key}) due to: {e}")
                         graph_state["enabled"] = False
                         graph_runners["cond"] = None
                         graph_runners["uncond"] = None
+                    except torch.cuda.OutOfMemoryError:
+                        log.warning("CUDA graph replay OOM, disabling graphs for this run.")
+                        graph_state["enabled"] = False
+                        graph_runners["cond"] = None
+                        graph_runners["uncond"] = None
+                        torch.cuda.empty_cache()
                 return transformer(**kwargs)
 
             autocast_enabled = ("fp8" in model["quantization"] and not transformer.patched_linear)
