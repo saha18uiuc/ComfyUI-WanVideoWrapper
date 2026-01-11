@@ -252,15 +252,23 @@ class CustomLinear(nn.Linear):
             if self._lora_cache_device == weight.device and self._lora_cache_dtype == weight.dtype:
                 return
         cached = []
+        fp8_safe_dtype = None
+        if hasattr(torch, "float8_e4m3fn") and weight.dtype == torch.float8_e4m3fn:
+            fp8_safe_dtype = torch.float16
+        if hasattr(torch, "float8_e4m3fnuz") and weight.dtype == torch.float8_e4m3fnuz:
+            fp8_safe_dtype = torch.float16
+        if hasattr(torch, "float8_e5m2") and weight.dtype == torch.float8_e5m2:
+            fp8_safe_dtype = torch.float16
         for lora_diff_names in self.lora_diffs:
             if isinstance(lora_diff_names, tuple):
-                lora_diff_0 = getattr(self, lora_diff_names[0]).to(weight.device, weight.dtype)
-                lora_diff_1 = getattr(self, lora_diff_names[1]).to(weight.device, weight.dtype)
+                mm_dtype = weight.dtype if fp8_safe_dtype is None else fp8_safe_dtype
+                lora_diff_0 = getattr(self, lora_diff_names[0]).to(weight.device, mm_dtype)
+                lora_diff_1 = getattr(self, lora_diff_names[1]).to(weight.device, mm_dtype)
                 lora_diff_2 = getattr(self, lora_diff_names[2])
                 patch = torch.mm(
                     lora_diff_0.flatten(start_dim=1),
                     lora_diff_1.flatten(start_dim=1)
-                ).reshape(weight.shape).contiguous()
+                ).reshape(weight.shape).to(weight.dtype).contiguous()
                 alpha = (float(lora_diff_2) / lora_diff_1.shape[0]) if (lora_diff_2 is not None and lora_diff_1.shape[0] != 0) else 1.0
             else:
                 lora_diff = getattr(self, lora_diff_names)
@@ -290,6 +298,13 @@ class CustomLinear(nn.Linear):
         if any(self._lora_strength_is_scheduled):
             return
         base_weight = self.weight.data if not self.is_gguf else self.weight
+        fp8_dtypes = []
+        if hasattr(torch, "float8_e4m3fn"):
+            fp8_dtypes.append(torch.float8_e4m3fn)
+        if hasattr(torch, "float8_e5m2"):
+            fp8_dtypes.append(torch.float8_e5m2)
+        if base_weight.dtype in fp8_dtypes:
+            return
         self._maybe_build_lora_cache(base_weight)
         if not self._lora_cached_deltas:
             return
