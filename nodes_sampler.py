@@ -130,6 +130,38 @@ class WanVideoSampler:
             transformer.offload_img_emb = block_swap_args.get("offload_img_emb", False)
             transformer.offload_txt_emb = block_swap_args.get("offload_txt_emb", False)
 
+        cuda_graph_options = transformer_options.get("cuda_graph_options", {})
+        graph_warmup_iters = int(cuda_graph_options.get("warmup_iters", 2))
+        graph_memory_factor = float(cuda_graph_options.get("memory_factor", 3.0))
+        graph_min_free_ratio = float(cuda_graph_options.get("min_free_ratio", 0.3))
+        graph_max_capture_ratio = float(cuda_graph_options.get("max_capture_ratio", 0.25))
+        env_ratio = os.environ.get("WAN_GRAPH_MAX_CAPTURE_RATIO", None)
+        if env_ratio:
+            try:
+                graph_max_capture_ratio = float(env_ratio)
+            except ValueError:
+                pass
+        env_min_ratio = os.environ.get("WAN_GRAPH_MIN_FREE_RATIO", None)
+        if env_min_ratio:
+            try:
+                graph_min_free_ratio = float(env_min_ratio)
+            except ValueError:
+                pass
+        env_memory_factor = os.environ.get("WAN_GRAPH_MEMORY_FACTOR", None)
+        if env_memory_factor:
+            try:
+                graph_memory_factor = float(env_memory_factor)
+            except ValueError:
+                pass
+        graph_max_capture_bytes = None
+        if device.type == "cuda" and torch.cuda.is_available():
+            device_index = device.index if device.index is not None else torch.cuda.current_device()
+            try:
+                total_mem = torch.cuda.get_device_properties(device_index).total_memory
+                graph_max_capture_bytes = int(total_mem * graph_max_capture_ratio)
+            except Exception:
+                graph_max_capture_bytes = None
+
         is_5b = transformer.out_dim == 48
         vae_upscale_factor = 16 if is_5b else 8
 
@@ -1207,6 +1239,13 @@ class WanVideoSampler:
         scheduler_graph_runner = None
         scheduler_graph_enabled = False
         scheduler_graph_flipped = None
+        graph_runner_config = {
+            "warmup_iters": graph_warmup_iters,
+            "memory_factor": graph_memory_factor,
+            "min_free_ratio": graph_min_free_ratio,
+            "max_capture_bytes": graph_max_capture_bytes,
+            "device": device if device.type == "cuda" else None,
+        }
         graph_blockers = [
             ("cache_args", cache_args is not None),
             ("teacache", getattr(transformer, "enable_teacache", False)),
@@ -1279,8 +1318,15 @@ class WanVideoSampler:
                 log.warning(f"Disabling CUDA graphs: {reason}")
             graph_state["enabled"] = False
             scheduler_graph_enabled = False
-            graph_runners["cond"] = None
-            graph_runners["uncond"] = None
+            for key in ("cond", "uncond"):
+                runner = graph_runners.get(key)
+                if runner is not None and hasattr(runner, "release"):
+                    runner.release()
+                graph_runners[key] = None
+            if scheduler_graph_runner is not None and hasattr(scheduler_graph_runner, "release"):
+                scheduler_graph_runner.release()
+            if scheduler_graph_flipped is not None and hasattr(scheduler_graph_flipped, "release"):
+                scheduler_graph_flipped.release()
             scheduler_graph_runner = None
             scheduler_graph_flipped = None
             try:
@@ -1299,7 +1345,7 @@ class WanVideoSampler:
                 and not flipped
             ):
                 if scheduler_graph_runner is None:
-                    scheduler_graph_runner = SchedulerGraphRunner(runner, scheduler_step_args)
+                    scheduler_graph_runner = SchedulerGraphRunner(runner, scheduler_step_args, warmup_iters=graph_runner_config["warmup_iters"])
                 try:
                     return scheduler_graph_runner(noise, timestep_tensor, latent_tensor)
                 except torch.cuda.OutOfMemoryError:
@@ -1310,7 +1356,7 @@ class WanVideoSampler:
                 and flipped
             ):
                 if scheduler_graph_flipped is None:
-                    scheduler_graph_flipped = SchedulerGraphRunner(runner, scheduler_step_args)
+                    scheduler_graph_flipped = SchedulerGraphRunner(runner, scheduler_step_args, warmup_iters=graph_runner_config["warmup_iters"])
                 try:
                     return scheduler_graph_flipped(noise, timestep_tensor, latent_tensor)
                 except torch.cuda.OutOfMemoryError:
@@ -1334,7 +1380,14 @@ class WanVideoSampler:
                 if graph_state["enabled"]:
                     runner = graph_runners[run_key]
                     if runner is None:
-                        graph_runners[run_key] = GraphDenoiser(transformer)
+                        graph_runners[run_key] = GraphDenoiser(
+                            transformer,
+                            warmup_iters=graph_runner_config["warmup_iters"],
+                            memory_factor=graph_runner_config["memory_factor"],
+                            min_free_ratio=graph_runner_config["min_free_ratio"],
+                            max_capture_bytes=graph_runner_config["max_capture_bytes"],
+                            device=graph_runner_config["device"],
+                        )
                         runner = graph_runners[run_key]
                     try:
                         return runner(**kwargs)

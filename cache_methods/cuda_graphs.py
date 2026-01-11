@@ -20,6 +20,15 @@ class SchedulerGraphRunner:
     def _clone_static(self, tensor):
         return tensor.detach().clone()
 
+    def release(self):
+        self.graph = None
+        self.static_noise = None
+        self.static_latent = None
+        self.static_timestep = None
+        self.output = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     def _capture(self, noise, timestep, latent):
         if not self.enabled or not noise.is_cuda:
             return
@@ -27,23 +36,27 @@ class SchedulerGraphRunner:
         self.static_latent = self._clone_static(latent)
         self.static_timestep = self._clone_static(timestep)
         torch.cuda.synchronize()
-        for _ in range(self.warmup_iters):
-            self.output = self.scheduler.step(
-                self.static_noise,
-                self.static_timestep,
-                self.static_latent,
-                **self.scheduler_step_args
-            )[0]
-        torch.cuda.synchronize()
-        self.graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(self.graph):
-            self.output = self.scheduler.step(
-                self.static_noise,
-                self.static_timestep,
-                self.static_latent,
-                **self.scheduler_step_args
-            )[0]
-        torch.cuda.synchronize()
+        try:
+            for _ in range(self.warmup_iters):
+                self.output = self.scheduler.step(
+                    self.static_noise,
+                    self.static_timestep,
+                    self.static_latent,
+                    **self.scheduler_step_args
+                )[0]
+            torch.cuda.synchronize()
+            self.graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(self.graph):
+                self.output = self.scheduler.step(
+                    self.static_noise,
+                    self.static_timestep,
+                    self.static_latent,
+                    **self.scheduler_step_args
+                )[0]
+            torch.cuda.synchronize()
+        except torch.cuda.OutOfMemoryError:
+            self.release()
+            raise
 
     def __call__(self, noise, timestep, latent):
         if not self.enabled or not noise.is_cuda:
@@ -56,7 +69,11 @@ class SchedulerGraphRunner:
             self.static_noise.copy_(noise)
             self.static_latent.copy_(latent)
             self.static_timestep.copy_(timestep)
-            self.graph.replay()
+            try:
+                self.graph.replay()
+            except torch.cuda.OutOfMemoryError:
+                self.release()
+                raise
         return self.output
 
 
@@ -66,10 +83,21 @@ class GraphDenoiser:
     Requires inputs to keep identical tree structure between invocations.
     """
 
-    def __init__(self, model, warmup_iters=2, memory_factor=2.0):
+    def __init__(
+        self,
+        model,
+        warmup_iters=2,
+        memory_factor=2.0,
+        min_free_ratio=0.3,
+        max_capture_bytes=None,
+        device=None,
+    ):
         self.model = model
         self.warmup_iters = warmup_iters
         self.memory_factor = memory_factor
+        self.min_free_ratio = min_free_ratio
+        self.max_capture_bytes = max_capture_bytes
+        self.device = device
         self.graph = None
         self.static_args = None
         self.static_kwargs = None
@@ -125,23 +153,41 @@ class GraphDenoiser:
             return sum(self._estimate_bytes(v) for v in obj.values())
         return 0
 
+    def _clear_graph(self):
+        self.graph = None
+        self.static_args = None
+        self.static_kwargs = None
+        self.output = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def release(self):
+        self._clear_graph()
+
     def _capture(self, args, kwargs):
         if not self.enabled:
             raise RuntimeError("CUDA graphs not available on this device.")
-        free_bytes = torch.cuda.mem_get_info()[0]
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        free_ratio = free_bytes / max(total_bytes, 1)
         required = self._estimate_bytes(args) + self._estimate_bytes(kwargs)
-        if required == 0 or free_bytes < required * self.memory_factor:
+        if self.max_capture_bytes is not None and required > self.max_capture_bytes:
+            raise RuntimeError("graph_insufficient_memory")
+        if required == 0 or free_bytes < required * self.memory_factor or free_ratio < self.min_free_ratio:
             raise RuntimeError("graph_insufficient_memory")
         self.static_args = self._clone_structure(args)
         self.static_kwargs = self._clone_structure(kwargs)
         torch.cuda.synchronize()
-        for _ in range(self.warmup_iters):
-            self.output = self.model(*self.static_args, **self.static_kwargs)
-        torch.cuda.synchronize()
-        self.graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(self.graph):
-            self.output = self.model(*self.static_args, **self.static_kwargs)
-        torch.cuda.synchronize()
+        try:
+            for _ in range(self.warmup_iters):
+                self.output = self.model(*self.static_args, **self.static_kwargs)
+            torch.cuda.synchronize()
+            self.graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(self.graph):
+                self.output = self.model(*self.static_args, **self.static_kwargs)
+            torch.cuda.synchronize()
+        except torch.cuda.OutOfMemoryError:
+            self._clear_graph()
+            raise
 
     def __call__(self, *args, **kwargs):
         if not self.enabled:
@@ -151,5 +197,9 @@ class GraphDenoiser:
         else:
             self._copy_structure(self.static_args, args)
             self._copy_structure(self.static_kwargs, kwargs)
-            self.graph.replay()
+            try:
+                self.graph.replay()
+            except torch.cuda.OutOfMemoryError:
+                self._clear_graph()
+                raise
         return self.output
