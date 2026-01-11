@@ -42,6 +42,7 @@ VAE_STRIDE = (4, 8, 8)
 PATCH_SIZE = (1, 2, 2)
 
 WAN_KEEP_XFORMERS = os.environ.get("WAN_KEEP_XFORMERS", "").strip().lower() in ("1", "true", "yes")
+WAN_FORCE_SDPA = os.environ.get("WAN_FORCE_SDPA", "").strip().lower() in ("1", "true", "yes")
 _XFORMERS_DISABLED_GLOBALLY = False
 
 
@@ -88,9 +89,9 @@ def _set_xformers_state(enabled: bool):
     return False
 
 
-def _disable_xformers_for_graphs():
+def _disable_xformers_for_graphs(force=False):
     global _XFORMERS_DISABLED_GLOBALLY
-    if WAN_KEEP_XFORMERS or _XFORMERS_DISABLED_GLOBALLY:
+    if (WAN_KEEP_XFORMERS and not force) or _XFORMERS_DISABLED_GLOBALLY:
         return False
     current_state = _get_xformers_state()
     if current_state is False:
@@ -170,6 +171,10 @@ class WanVideoSampler:
         transformer_options = copy.deepcopy(patcher.model_options.get("transformer_options", None))
         if transformer_options is None:
             transformer_options = {}
+        force_sdpa_attention = transformer_options.get("force_sdpa_attention", False) or WAN_FORCE_SDPA
+        transformer_options["force_sdpa_attention"] = force_sdpa_attention
+        if force_sdpa_attention:
+            _disable_xformers_for_graphs(force=True)
         merge_loras = transformer_options["merge_loras"]
         use_cuda_graphs = transformer_options.get("enable_cuda_graphs", False)
         env_force_cuda_graphs = os.environ.get("WAN_FORCE_CUDA_GRAPHS", "").strip().lower() in ("1", "true", "yes")
@@ -315,6 +320,15 @@ class WanVideoSampler:
 
         total_steps = steps
         steps = len(timesteps)
+
+        if force_sdpa_attention and transformer_options.get("attention_mode_override", None) is None:
+            transformer_options["attention_mode_override"] = {
+                "mode": "sdpa",
+                "blocks": None,
+                "start_step": 0,
+                "end_step": steps,
+                "verbose": False,
+            }
 
         is_pusa = "pusa" in sample_scheduler.__class__.__name__.lower()
 
