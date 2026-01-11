@@ -299,7 +299,8 @@ class CustomLinear(nn.Linear):
         cache = {
             "A": torch.stack(a_list, dim=0).contiguous(),
             "B": torch.stack(b_list, dim=0).contiguous(),
-            "alpha": torch.tensor(alpha_list, dtype=torch.float32, device=weight.device),
+            "alpha_tensor": torch.tensor(alpha_list, dtype=torch.float32, device=weight.device),
+            "out_buffer": None,
         }
         self._grouped_cache = cache
         self._grouped_cache_device = weight.device
@@ -341,20 +342,33 @@ class CustomLinear(nn.Linear):
             cache = self._maybe_build_grouped_cache(weight)
         if cache is None:
             return None
-        scales = []
+        strength_values = []
         for idx in range(len(self.lora_diffs)):
             strength = self._get_lora_strength(idx)
             if not torch.is_tensor(strength):
                 strength = torch.tensor(strength, device=input.device, dtype=input.dtype)
             if strength.numel() != 1:
                 return None
-            scales.append((strength.to(torch.float32) * cache["alpha"][idx]).item())
-        if not scales:
+            strength_values.append(strength.reshape(1))
+        if not strength_values:
             return None
-        scales_tensor = torch.tensor(scales, device=input.device, dtype=torch.float32)
+        strengths_tensor = torch.cat(strength_values).to(device=input.device, dtype=torch.float32)
+        alpha_tensor = cache["alpha_tensor"].to(input.device)
+        if alpha_tensor.shape[0] != strengths_tensor.shape[0]:
+            return None
+        scales_tensor = strengths_tensor * alpha_tensor
         input_2d = input.reshape(-1, input.shape[-1]).contiguous()
-        delta = grouped_lora_forward(input_2d, cache["A"], cache["B"], scales_tensor)
-        return delta.reshape(*input.shape[:-1], delta.shape[-1])
+        expected_shape = (input_2d.shape[0], cache["B"].shape[1])
+        buffer = cache.get("out_buffer")
+        if (
+            buffer is None
+            or buffer.shape != expected_shape
+            or buffer.device != input_2d.device
+        ):
+            buffer = torch.zeros(expected_shape, device=input_2d.device, dtype=torch.float32)
+            cache["out_buffer"] = buffer
+        delta = grouped_lora_forward(input_2d, cache["A"], cache["B"], scales_tensor, out_buffer=buffer)
+        return delta.reshape(*input.shape[:-1], delta.shape[-1]).to(input.dtype)
 
     def _prepare_weight(self, input):
         """Prepare weight tensor - handles both regular and GGUF weights"""

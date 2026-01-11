@@ -104,7 +104,7 @@ def grouped_lora_available():
     return True
 
 
-def grouped_lora_forward(x, a, b, scales):
+def grouped_lora_forward(x, a, b, scales, out_buffer=None):
     """
     Compute fused LoRA contribution for a batch of inputs.
 
@@ -127,7 +127,15 @@ def grouped_lora_forward(x, a, b, scales):
     num_loras, rank, _ = a.shape
     out_features = b.shape[1]
 
-    out = torch.zeros((batch, out_features), device=x.device, dtype=torch.float32)
+    if out_buffer is None:
+        out = torch.zeros((batch, out_features), device=x.device, dtype=torch.float32)
+    else:
+        if out_buffer.shape != (batch, out_features):
+            raise ValueError("Provided LoRA buffer has invalid shape.")
+        if out_buffer.device != x.device:
+            raise ValueError("Provided LoRA buffer is on the wrong device.")
+        out = out_buffer
+        out.zero_()
     grid = (
         triton.cdiv(batch, BLOCK_M),
         triton.cdiv(out_features, BLOCK_N),
@@ -159,4 +167,4 @@ def grouped_lora_forward(x, a, b, scales):
         BLOCK_K=BLOCK_K,
         BLOCK_R=BLOCK_R,
     )
-    return out.to(x.dtype)
+    return out

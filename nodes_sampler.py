@@ -178,6 +178,7 @@ class WanVideoSampler:
             load_weights(patcher.model.diffusion_model, patcher.model["sd"], weight_dtype, base_dtype=dtype, transformer_load_device=device,
                          block_swap_args=block_swap_args, compile_args=model["compile_args"])
 
+        total_lora_patches = len(patcher.patches)
         if gguf_reader is not None: #handle GGUF
             load_weights(transformer, patcher.model["sd"], base_dtype=dtype, transformer_load_device=device, patcher=patcher, gguf=True,
                          reader=gguf_reader, block_swap_args=block_swap_args, compile_args=model["compile_args"])
@@ -189,6 +190,17 @@ class WanVideoSampler:
                 raise NotImplementedError("FP8 matmul with unmerged LoRAs is not supported")
             set_lora_params(transformer, patcher.patches)
             static_threshold = transformer_options.get("static_lora_merge_threshold", 8)
+            auto_merge_enabled = transformer_options.get("auto_static_lora_merge", True)
+            if auto_merge_enabled and static_threshold > 2 and total_lora_patches >= 256:
+                if total_lora_patches >= 1024:
+                    adaptive_threshold = 2
+                elif total_lora_patches >= 512:
+                    adaptive_threshold = 3
+                else:
+                    adaptive_threshold = 4
+                if adaptive_threshold < static_threshold:
+                    log.info(f"Auto-adjusting static LoRA merge threshold from {static_threshold} to {adaptive_threshold} based on {total_lora_patches} patches.")
+                    static_threshold = adaptive_threshold
             merge_static_lora_weights(transformer, min_patches=static_threshold)
         else:
             remove_lora_from_module(transformer) #clear possible unmerged lora weights

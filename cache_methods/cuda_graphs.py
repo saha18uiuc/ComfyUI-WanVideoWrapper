@@ -103,6 +103,13 @@ class GraphDenoiser:
         self.static_kwargs = None
         self.output = None
         self.enabled = torch.cuda.is_available()
+        self.capture_stream = None
+        if (
+            self.enabled
+            and isinstance(self.device, torch.device)
+            and self.device.type == "cuda"
+        ):
+            self.capture_stream = torch.cuda.Stream(device=self.device)
 
     def _clone_structure(self, obj):
         if torch.is_tensor(obj):
@@ -176,18 +183,28 @@ class GraphDenoiser:
             raise RuntimeError("graph_insufficient_memory")
         self.static_args = self._clone_structure(args)
         self.static_kwargs = self._clone_structure(kwargs)
-        torch.cuda.synchronize()
+        torch.cuda.synchronize(device=self.device)
         try:
-            for _ in range(self.warmup_iters):
-                self.output = self.model(*self.static_args, **self.static_kwargs)
-            torch.cuda.synchronize()
-            self.graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(self.graph):
-                self.output = self.model(*self.static_args, **self.static_kwargs)
-            torch.cuda.synchronize()
+            stream = self.capture_stream or torch.cuda.current_stream(device=self.device)
+            current_stream = torch.cuda.current_stream(device=self.device)
+            if stream is not current_stream:
+                stream.wait_stream(current_stream)
+            with torch.cuda.stream(stream):
+                for _ in range(self.warmup_iters):
+                    self.output = self.model(*self.static_args, **self.static_kwargs)
+                stream.synchronize()
+                self.graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(self.graph, stream=stream):
+                    self.output = self.model(*self.static_args, **self.static_kwargs)
+                stream.synchronize()
+            if stream is not current_stream:
+                current_stream.wait_stream(stream)
         except torch.cuda.OutOfMemoryError:
             self._clear_graph()
             raise
+        except RuntimeError as exc:
+            self._clear_graph()
+            raise RuntimeError(f"graph_capture_failed: {exc}") from exc
 
     def __call__(self, *args, **kwargs):
         if not self.enabled:
@@ -198,8 +215,17 @@ class GraphDenoiser:
             self._copy_structure(self.static_args, args)
             self._copy_structure(self.static_kwargs, kwargs)
             try:
+                stream = self.capture_stream or torch.cuda.current_stream(device=self.device)
+                current_stream = torch.cuda.current_stream(device=self.device)
+                if stream is not current_stream:
+                    stream.wait_stream(current_stream)
                 self.graph.replay()
+                if stream is not current_stream:
+                    current_stream.wait_stream(stream)
             except torch.cuda.OutOfMemoryError:
                 self._clear_graph()
                 raise
+            except RuntimeError as exc:
+                self._clear_graph()
+                raise RuntimeError(f"graph_replay_failed: {exc}") from exc
         return self.output
