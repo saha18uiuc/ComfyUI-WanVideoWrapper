@@ -1,3 +1,5 @@
+import os
+import collections
 import torch
 
 
@@ -98,10 +100,6 @@ class GraphDenoiser:
         self.min_free_ratio = min_free_ratio
         self.max_capture_bytes = max_capture_bytes
         self.device = device
-        self.graph = None
-        self.static_args = None
-        self.static_kwargs = None
-        self.output = None
         self.enabled = torch.cuda.is_available()
         self.capture_stream = None
         if (
@@ -110,6 +108,11 @@ class GraphDenoiser:
             and self.device.type == "cuda"
         ):
             self.capture_stream = torch.cuda.Stream(device=self.device)
+        self.graph_cache = collections.OrderedDict()
+        self.max_cached_variants = max(
+            1,
+            int(os.environ.get("WAN_MAX_GRAPH_VARIANTS", "4"))
+        )
 
     def _clone_structure(self, obj):
         if torch.is_tensor(obj):
@@ -161,15 +164,44 @@ class GraphDenoiser:
         return 0
 
     def _clear_graph(self):
-        self.graph = None
-        self.static_args = None
-        self.static_kwargs = None
-        self.output = None
+        self.graph_cache.clear()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
     def release(self):
         self._clear_graph()
+
+    def _signature(self, obj):
+        sig = []
+
+        def encode(item):
+            if torch.is_tensor(item):
+                sig.append(
+                    (
+                        "tensor",
+                        tuple(item.shape),
+                        str(item.dtype),
+                        item.device.type,
+                    )
+                )
+                return
+            if isinstance(item, (list, tuple)):
+                sig.append(("list", len(item)))
+                for sub in item:
+                    encode(sub)
+                return
+            if isinstance(item, dict):
+                sig.append(("dict", tuple(sorted(item.keys()))))
+                for key in sorted(item.keys()):
+                    encode(item[key])
+                return
+            sig.append(("obj", type(item).__name__))
+
+        encode(obj)
+        return tuple(sig)
+
+    def _args_signature(self, args, kwargs):
+        return (self._signature(args), self._signature(kwargs))
 
     def _capture(self, args, kwargs):
         if not self.enabled:
@@ -181,8 +213,8 @@ class GraphDenoiser:
             raise RuntimeError("graph_insufficient_memory")
         if required == 0 or free_bytes < required * self.memory_factor or free_ratio < self.min_free_ratio:
             raise RuntimeError("graph_insufficient_memory")
-        self.static_args = self._clone_structure(args)
-        self.static_kwargs = self._clone_structure(kwargs)
+        static_args = self._clone_structure(args)
+        static_kwargs = self._clone_structure(kwargs)
         torch.cuda.synchronize(device=self.device)
         try:
             stream = self.capture_stream or torch.cuda.current_stream(device=self.device)
@@ -191,41 +223,53 @@ class GraphDenoiser:
                 stream.wait_stream(current_stream)
             with torch.cuda.stream(stream):
                 for _ in range(self.warmup_iters):
-                    self.output = self.model(*self.static_args, **self.static_kwargs)
+                    output = self.model(*static_args, **static_kwargs)
                 stream.synchronize()
-                self.graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(self.graph, stream=stream):
-                    self.output = self.model(*self.static_args, **self.static_kwargs)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, stream=stream):
+                    output = self.model(*static_args, **static_kwargs)
                 stream.synchronize()
             if stream is not current_stream:
                 current_stream.wait_stream(stream)
+            return {
+                "graph": graph,
+                "static_args": static_args,
+                "static_kwargs": static_kwargs,
+                "output": output,
+            }
         except torch.cuda.OutOfMemoryError:
-            self._clear_graph()
             raise
         except RuntimeError as exc:
-            self._clear_graph()
             raise RuntimeError(f"graph_capture_failed: {exc}") from exc
 
     def __call__(self, *args, **kwargs):
         if not self.enabled:
             return self.model(*args, **kwargs)
-        if self.graph is None:
-            self._capture(args, kwargs)
+        signature = self._args_signature(args, kwargs)
+        entry = self.graph_cache.get(signature)
+        if entry is None:
+            try:
+                entry = self._capture(args, kwargs)
+            except RuntimeError as exc:
+                raise exc
+            if len(self.graph_cache) >= self.max_cached_variants:
+                self.graph_cache.popitem(last=False)
+            self.graph_cache[signature] = entry
         else:
-            self._copy_structure(self.static_args, args)
-            self._copy_structure(self.static_kwargs, kwargs)
+            self._copy_structure(entry["static_args"], args)
+            self._copy_structure(entry["static_kwargs"], kwargs)
             try:
                 stream = self.capture_stream or torch.cuda.current_stream(device=self.device)
                 current_stream = torch.cuda.current_stream(device=self.device)
                 if stream is not current_stream:
                     stream.wait_stream(current_stream)
-                self.graph.replay()
+                entry["graph"].replay()
                 if stream is not current_stream:
                     current_stream.wait_stream(stream)
             except torch.cuda.OutOfMemoryError:
-                self._clear_graph()
+                self.graph_cache.pop(signature, None)
                 raise
             except RuntimeError as exc:
-                self._clear_graph()
                 raise RuntimeError(f"graph_replay_failed: {exc}") from exc
-        return self.output
+        self.graph_cache.move_to_end(signature)
+        return self.graph_cache[signature]["output"]

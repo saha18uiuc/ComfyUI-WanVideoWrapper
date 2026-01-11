@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.nn as nn
 from accelerate import init_empty_weights
@@ -10,6 +11,9 @@ except Exception:
 
     def grouped_lora_forward(*args, **kwargs):
         raise RuntimeError("Grouped LoRA kernel unavailable (missing dependencies).")
+
+MERGE_STATIC_LORA = os.environ.get("WAN_MERGE_STATIC_LORA", "1").strip().lower() in ("1", "true", "yes")
+
 
 @torch.library.custom_op("wanvideo::apply_lora", mutates_args=())
 def apply_lora(weight: torch.Tensor, lora_diff_0: torch.Tensor, lora_diff_1: torch.Tensor, lora_diff_2: float, lora_strength: torch.Tensor) -> torch.Tensor:
@@ -158,6 +162,8 @@ class CustomLinear(nn.Linear):
         self._grouped_cache_device = None
         self._grouped_cache_dtype = None
         self.grouped_lora_enabled = True
+        self.merge_static_lora = MERGE_STATIC_LORA
+        self._static_lora_merged = False
 
         if not allow_compile:
             self._apply_lora_impl = self._apply_lora_custom_op
@@ -207,6 +213,7 @@ class CustomLinear(nn.Linear):
 
     def set_lora_diffs(self, lora_diffs, device=torch.device("cpu")):
         self._reset_lora_cache()
+        self._static_lora_merged = False
         self.lora_diffs = []
         for i, diff in enumerate(lora_diffs):
             if len(diff) > 1:
@@ -231,6 +238,8 @@ class CustomLinear(nn.Linear):
                 tensor = torch.tensor([strength], dtype=self.compute_dtype, device=device)
                 self.register_buffer(f"_lora_strength_{i}", tensor)
                 self._lora_strength_is_scheduled.append(False)
+        if self.merge_static_lora:
+            self._try_merge_static_lora()
 
     def _get_lora_strength(self, idx):
         strength_tensor = getattr(self, f"_lora_strength_{idx}")
@@ -261,6 +270,48 @@ class CustomLinear(nn.Linear):
         self._lora_cached_deltas = cached
         self._lora_cache_device = weight.device
         self._lora_cache_dtype = weight.dtype
+
+    def _clear_lora_state(self):
+        if getattr(self, "lora_diffs", None):
+            for idx in range(len(self.lora_diffs)):
+                strength_name = f"_lora_strength_{idx}"
+                if hasattr(self, strength_name):
+                    delattr(self, strength_name)
+        self.lora_diffs = []
+        self._lora_strength_is_scheduled = []
+        self._reset_lora_cache()
+        self.grouped_lora_enabled = False
+
+    def _try_merge_static_lora(self):
+        if self._static_lora_merged:
+            return
+        if getattr(self, "lora_diffs", None) is None or not self.lora_diffs:
+            return
+        if any(self._lora_strength_is_scheduled):
+            return
+        base_weight = self.weight.data if not self.is_gguf else self.weight
+        self._maybe_build_lora_cache(base_weight)
+        if not self._lora_cached_deltas:
+            return
+        merged = False
+        with torch.no_grad():
+            for idx, (patch_diff, alpha) in enumerate(self._lora_cached_deltas):
+                strength = self._get_lora_strength(idx)
+                if torch.is_tensor(strength):
+                    if strength.numel() != 1:
+                        return
+                    strength_value = strength.item()
+                else:
+                    strength_value = float(strength)
+                if strength_value == 0.0:
+                    continue
+                merged = True
+                scale = strength_value * alpha
+                patch = patch_diff.to(base_weight.device, base_weight.dtype)
+                base_weight.add_(patch, alpha=scale)
+        if merged:
+            self._clear_lora_state()
+            self._static_lora_merged = True
 
     def _maybe_build_grouped_cache(self, weight):
         if (
