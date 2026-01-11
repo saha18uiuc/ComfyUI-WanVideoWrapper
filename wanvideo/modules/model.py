@@ -2622,7 +2622,9 @@ class WanModel(torch.nn.Module):
                 padded[idx, :length].copy_(u.squeeze(0))
             x = padded
         else:
-            x = self.original_patch_embedding.weight.new_zeros((0, seq_len, self.original_patch_embedding.weight.shape[0]))
+            x = self.original_patch_embedding.weight.new_zeros(
+                (0, seq_len, self.original_patch_embedding.weight.shape[0])
+            )
 
         if self.trainable_cond_mask is not None:
             x = x + cond_mask_weight[0]
