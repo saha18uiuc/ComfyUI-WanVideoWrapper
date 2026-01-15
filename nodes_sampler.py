@@ -1986,13 +1986,13 @@ class WanVideoSampler:
                             partial_wananim_face_pixels = partial_wananim_pose_latents = None
                             if wananim_face_pixels is not None and partial_wananim_face_pixels is None:
                                 start = c[0] * 4
-                                end = c[-1] * 4
+                                end = c[-1] * 4 + 1
                                 center_indices = torch.arange(start, end, 1)
                                 center_indices = torch.clamp(center_indices, min=0, max=wananim_face_pixels.shape[2] - 1)
                                 partial_wananim_face_pixels = wananim_face_pixels[:, :, center_indices].to(device, dtype)
                             if wananim_pose_latents is not None:
                                 start = c[0]
-                                end = c[-1]
+                                end = c[-1] + 1
                                 center_indices = torch.arange(start, end, 1)
                                 center_indices = torch.clamp(center_indices, min=0, max=wananim_pose_latents.shape[2] - 1)
                                 partial_wananim_pose_latents = wananim_pose_latents[:, :, center_indices][:, :, :context_frames-1].to(device, dtype)
