@@ -13,9 +13,11 @@ except Exception:
         raise RuntimeError("Grouped LoRA kernel unavailable (missing dependencies).")
 
 MERGE_STATIC_LORA = os.environ.get("WAN_MERGE_STATIC_LORA", "1").strip().lower() in ("1", "true", "yes")
-# NEW: Memory-safe LoRA options
+# Memory-safe LoRA options
 LORA_MERGE_ON_CPU = os.environ.get("WAN_LORA_MERGE_ON_CPU", "0").strip().lower() in ("1", "true", "yes")
 LORA_AGGRESSIVE_MEMORY = os.environ.get("WAN_LORA_AGGRESSIVE_MEMORY", "0").strip().lower() in ("1", "true", "yes")
+# On-demand LoRA: compute patches on-the-fly without caching (saves both GPU and CPU memory)
+LORA_NO_CACHE = os.environ.get("WAN_LORA_NO_CACHE", "0").strip().lower() in ("1", "true", "yes")
 
 
 @torch.library.custom_op("wanvideo::apply_lora", mutates_args=())
@@ -251,6 +253,10 @@ class CustomLinear(nn.Linear):
         return strength_tensor[0]
 
     def _maybe_build_lora_cache(self, weight):
+        # Skip caching entirely if no-cache mode is enabled
+        if LORA_NO_CACHE:
+            return
+            
         if self._lora_cached_deltas is not None:
             # If using CPU mode, cache device should be 'cpu'
             target_device = 'cpu' if LORA_MERGE_ON_CPU else weight.device
@@ -392,11 +398,16 @@ class CustomLinear(nn.Linear):
         if not getattr(self, "lora_diffs", None):
             return weight
 
+        # On-demand mode: compute LoRA patches on-the-fly without caching
+        # This saves both GPU and CPU memory but is slower
+        if LORA_NO_CACHE:
+            return self._get_weight_with_lora_no_cache(weight)
+
         self._maybe_build_lora_cache(weight)
         if not self._lora_cached_deltas:
             return weight
 
-        # NEW: CPU-based LoRA computation for memory-constrained environments
+        # CPU-based LoRA computation for memory-constrained environments
         if LORA_MERGE_ON_CPU and weight.device.type == 'cuda':
             return self._get_weight_with_lora_cpu(weight)
 
@@ -417,6 +428,55 @@ class CustomLinear(nn.Linear):
             if LORA_AGGRESSIVE_MEMORY:
                 del scale
                 
+        return weight
+    
+    def _get_weight_with_lora_no_cache(self, weight):
+        """
+        Apply LoRA on-demand without caching - saves both GPU and CPU memory.
+        Computes each LoRA patch directly from the stored A/B matrices.
+        """
+        fp8_safe_dtype = None
+        if hasattr(torch, "float8_e4m3fn") and weight.dtype == torch.float8_e4m3fn:
+            fp8_safe_dtype = torch.float16
+        if hasattr(torch, "float8_e4m3fnuz") and weight.dtype == torch.float8_e4m3fnuz:
+            fp8_safe_dtype = torch.float16
+        if hasattr(torch, "float8_e5m2") and weight.dtype == torch.float8_e5m2:
+            fp8_safe_dtype = torch.float16
+        
+        for idx, lora_diff_names in enumerate(self.lora_diffs):
+            lora_strength = self._get_lora_strength(idx)
+            if isinstance(lora_strength, torch.Tensor):
+                strength_value = lora_strength.to(weight.device, weight.dtype)
+            else:
+                strength_value = torch.tensor(lora_strength, device=weight.device, dtype=weight.dtype)
+
+            if torch.all(strength_value == 0):
+                continue
+            
+            if isinstance(lora_diff_names, tuple):
+                # Compute patch on-demand from A and B matrices
+                mm_dtype = weight.dtype if fp8_safe_dtype is None else fp8_safe_dtype
+                lora_diff_0 = getattr(self, lora_diff_names[0]).to(weight.device, mm_dtype)
+                lora_diff_1 = getattr(self, lora_diff_names[1]).to(weight.device, mm_dtype)
+                lora_diff_2 = getattr(self, lora_diff_names[2])
+                
+                patch_diff = torch.mm(
+                    lora_diff_0.flatten(start_dim=1),
+                    lora_diff_1.flatten(start_dim=1)
+                ).reshape(weight.shape).to(weight.dtype)
+                
+                alpha = (float(lora_diff_2) / lora_diff_1.shape[0]) if (lora_diff_2 is not None and lora_diff_1.shape[0] != 0) else 1.0
+                
+                # Apply and immediately free
+                scale = strength_value * alpha
+                weight = weight + patch_diff * scale
+                del lora_diff_0, lora_diff_1, patch_diff, scale
+            else:
+                # Pre-computed diff
+                lora_diff = getattr(self, lora_diff_names).to(weight.device, weight.dtype)
+                weight = weight + lora_diff * strength_value
+                del lora_diff
+        
         return weight
     
     def _get_weight_with_lora_cpu(self, weight):
