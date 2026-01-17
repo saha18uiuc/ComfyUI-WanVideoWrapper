@@ -211,7 +211,9 @@ def rope_params(max_seq_len, dim, theta=10000, L_test=25, k=0, freqs_scaling=1.0
     return freqs
 
 @torch.autocast(device_type=mm.get_autocast_device(mm.get_torch_device()), enabled=False)
-@torch.compiler.disable()
+# NOTE: @torch.compiler.disable() REMOVED for CUDA graph compatibility
+# The rope_apply_triton in wanvideo/kernels/rope_triton.py is compile-friendly
+# See PERFORMANCE_OPTIMIZATION_DESIGN.md Phase 3 for details
 def rope_apply(x, grid_sizes, freqs, reverse_time=False):
     x_ndim = grid_sizes.shape[-1]
     if x_ndim == 3:
