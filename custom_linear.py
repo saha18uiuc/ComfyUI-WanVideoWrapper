@@ -13,6 +13,9 @@ except Exception:
         raise RuntimeError("Grouped LoRA kernel unavailable (missing dependencies).")
 
 MERGE_STATIC_LORA = os.environ.get("WAN_MERGE_STATIC_LORA", "1").strip().lower() in ("1", "true", "yes")
+# NEW: Memory-safe LoRA options
+LORA_MERGE_ON_CPU = os.environ.get("WAN_LORA_MERGE_ON_CPU", "0").strip().lower() in ("1", "true", "yes")
+LORA_AGGRESSIVE_MEMORY = os.environ.get("WAN_LORA_AGGRESSIVE_MEMORY", "0").strip().lower() in ("1", "true", "yes")
 
 
 @torch.library.custom_op("wanvideo::apply_lora", mutates_args=())
@@ -249,7 +252,9 @@ class CustomLinear(nn.Linear):
 
     def _maybe_build_lora_cache(self, weight):
         if self._lora_cached_deltas is not None:
-            if self._lora_cache_device == weight.device and self._lora_cache_dtype == weight.dtype:
+            # If using CPU mode, cache device should be 'cpu'
+            target_device = 'cpu' if LORA_MERGE_ON_CPU else weight.device
+            if self._lora_cache_device == target_device and self._lora_cache_dtype == weight.dtype:
                 return
         cached = []
         fp8_safe_dtype = None
@@ -259,25 +264,34 @@ class CustomLinear(nn.Linear):
             fp8_safe_dtype = torch.float16
         if hasattr(torch, "float8_e5m2") and weight.dtype == torch.float8_e5m2:
             fp8_safe_dtype = torch.float16
+            
+        # Determine device for LoRA cache computation
+        compute_device = 'cpu' if LORA_MERGE_ON_CPU else weight.device
+        cache_dtype = torch.float32 if LORA_MERGE_ON_CPU else weight.dtype
+        
         for lora_diff_names in self.lora_diffs:
             if isinstance(lora_diff_names, tuple):
-                mm_dtype = weight.dtype if fp8_safe_dtype is None else fp8_safe_dtype
-                lora_diff_0 = getattr(self, lora_diff_names[0]).to(weight.device, mm_dtype)
-                lora_diff_1 = getattr(self, lora_diff_names[1]).to(weight.device, mm_dtype)
+                mm_dtype = cache_dtype if fp8_safe_dtype is None else fp8_safe_dtype
+                # Do LoRA computation on CPU if flag is set to save GPU memory
+                lora_diff_0 = getattr(self, lora_diff_names[0]).to(compute_device, mm_dtype)
+                lora_diff_1 = getattr(self, lora_diff_names[1]).to(compute_device, mm_dtype)
                 lora_diff_2 = getattr(self, lora_diff_names[2])
                 patch = torch.mm(
                     lora_diff_0.flatten(start_dim=1),
                     lora_diff_1.flatten(start_dim=1)
-                ).reshape(weight.shape).to(weight.dtype).contiguous()
+                ).reshape(weight.shape).to(cache_dtype).contiguous()
                 alpha = (float(lora_diff_2) / lora_diff_1.shape[0]) if (lora_diff_2 is not None and lora_diff_1.shape[0] != 0) else 1.0
+                # Clean up intermediate tensors
+                del lora_diff_0, lora_diff_1
             else:
                 lora_diff = getattr(self, lora_diff_names)
-                patch = lora_diff.to(weight.device, weight.dtype).contiguous()
+                patch = lora_diff.to(compute_device, cache_dtype).contiguous()
                 alpha = 1.0
             cached.append((patch, alpha))
+            
         self._lora_cached_deltas = cached
-        self._lora_cache_device = weight.device
-        self._lora_cache_dtype = weight.dtype
+        self._lora_cache_device = compute_device
+        self._lora_cache_dtype = cache_dtype
 
     def _clear_lora_state(self):
         if getattr(self, "lora_diffs", None):
@@ -382,6 +396,10 @@ class CustomLinear(nn.Linear):
         if not self._lora_cached_deltas:
             return weight
 
+        # NEW: CPU-based LoRA computation for memory-constrained environments
+        if LORA_MERGE_ON_CPU and weight.device.type == 'cuda':
+            return self._get_weight_with_lora_cpu(weight)
+
         for idx, (patch_diff, alpha) in enumerate(self._lora_cached_deltas):
             lora_strength = self._get_lora_strength(idx)
             if isinstance(lora_strength, torch.Tensor):
@@ -394,7 +412,47 @@ class CustomLinear(nn.Linear):
 
             scale = strength_value * alpha
             weight = weight + patch_diff * scale
+            
+            # Clear intermediate tensors if aggressive memory mode
+            if LORA_AGGRESSIVE_MEMORY:
+                del scale
+                
         return weight
+    
+    def _get_weight_with_lora_cpu(self, weight):
+        """Apply LoRA on CPU to save GPU memory, then move result back to GPU"""
+        original_device = weight.device
+        original_dtype = weight.dtype
+        
+        # Move weight to CPU for computation
+        weight_cpu = weight.to('cpu', dtype=torch.float32)
+        
+        for idx, (patch_diff, alpha) in enumerate(self._lora_cached_deltas):
+            lora_strength = self._get_lora_strength(idx)
+            if isinstance(lora_strength, torch.Tensor):
+                strength_value = lora_strength.cpu().float()
+            else:
+                strength_value = torch.tensor(lora_strength, device='cpu', dtype=torch.float32)
+
+            if torch.all(strength_value == 0):
+                continue
+
+            # Move patch_diff to CPU if needed
+            if patch_diff.device.type != 'cpu':
+                patch_diff_cpu = patch_diff.cpu().float()
+            else:
+                patch_diff_cpu = patch_diff.float()
+            
+            scale = strength_value * alpha
+            weight_cpu = weight_cpu + patch_diff_cpu * scale
+            
+            del patch_diff_cpu, scale
+        
+        # Move result back to GPU
+        result = weight_cpu.to(original_device, dtype=original_dtype)
+        del weight_cpu
+        
+        return result
 
     def _compute_grouped_lora(self, input, weight):
         if not grouped_lora_available():
