@@ -34,27 +34,29 @@ os.environ["MAX_FRAMES"] = str(MAX_FRAMES)
 os.environ["WIDTH"] = "512"
 os.environ["HEIGHT"] = "512"
 os.environ["AUDIO_SCALE_STRENGTH"] = "2"
-os.environ["FRAME_WINDOW_SIZE"] = "25"
 
 # ============================================================
-# STEP 4: SPEED OPTIMIZATIONS
+# STEP 4: AGGRESSIVE SPEED OPTIMIZATIONS
 # ============================================================
 
-# 1. REDUCE DIFFUSION STEPS: 3 -> 2 (saves ~33% sampling time!)
-os.environ["MAX_STEPS"] = "2"
+# 1. LARGER WINDOW SIZE: 25 -> 41 frames per window
+#    With 120 frames and overlap of 5: 120/(41-5)+1 = 4.3 → 5 windows (vs 7)
+#    Saves 2 full window cycles (~38 seconds)
+os.environ["FRAME_WINDOW_SIZE"] = "41"
 
-# 2. REDUCE WINDOW OVERLAP: 25 -> 5 frames overlap
-#    This reduces windows from 8 to ~5, saving ~3 windows worth of compute
-#    Formula: windows = total_frames / (window_size - overlap) + 1
-#    120 / (25-5) + 1 = 7 windows (vs 8 with overlap=9)
+# 2. MINIMAL OVERLAP: 5 frames (already optimized)
 os.environ["MOTION_FRAME"] = "5"
 
-# 3. PUNICA-STYLE LORA (already optimized)
+# 3. REDUCE STEPS: 2 -> 1 (EXTREME - may affect quality significantly)
+#    Each window takes ~8s per step, so 1 step saves ~8s per window
+#    With 5 windows: saves ~40 seconds
+os.environ["MAX_STEPS"] = "1"
+
+# 4. PUNICA-STYLE LORA (already optimized)
 os.environ["WAN_LORA_ONTHEFLY"] = "1"
 os.environ["WAN_LORA_TIMING"] = "1"
 
-# 4. OPTIONAL: torch.compile (experimental - has warmup cost)
-# Uncomment to try - might help on subsequent runs
+# 5. Enable torch.compile for transformer (experimental)
 # os.environ["WAN_TORCH_COMPILE"] = "1"
 
 # ============================================================
@@ -78,17 +80,18 @@ os.environ["REF_IMAGE"] = str(ref_image)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 print("=" * 60)
-print("MAXIMUM SPEED OPTIMIZATION RUN")
+print("EXTREME SPEED OPTIMIZATION RUN")
 print("=" * 60)
 print(f"512x512 @ 5s, {MAX_FRAMES} frames")
 print()
-print("SPEED OPTIMIZATIONS:")
-print(f"  ✓ Reduced steps: 3 → 2 (saves ~33% sampling time)")
-print(f"  ✓ Reduced overlap: MOTION_FRAME=5 (fewer windows)")
+print("AGGRESSIVE OPTIMIZATIONS:")
+print(f"  ✓ Single step: MAX_STEPS=1 (saves ~40s)")
+print(f"  ✓ Larger windows: 41 frames (5 windows vs 7)")
+print(f"  ✓ Minimal overlap: MOTION_FRAME=5")
 print(f"  ✓ Punica-style LoRA with A/B GPU caching")
-print(f"  ✓ torch.addmm fused operations")
 print()
-print("EXPECTED: ~5-6 minutes (down from 7.8 min)")
+print("⚠️  WARNING: 1 step will reduce quality significantly!")
+print("EXPECTED: ~4-5 minutes (down from 6.5 min)")
 print("=" * 60)
 
 # Pull latest optimizations
