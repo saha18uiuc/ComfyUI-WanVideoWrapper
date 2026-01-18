@@ -854,6 +854,7 @@ class CustomLinear(nn.Linear):
         - A, B are small (~0.5MB each for rank 64)
         - Transfer once, reuse for all subsequent forward passes
         - Eliminates 30,000+ redundant CPU→GPU transfers
+        - MEMORY-SAFE: Skips caching if GPU memory is low (< 2GB free)
         
         Memory: A is (out_features, rank), B is (rank, in_features)
         vs delta is (out_features, in_features) - much larger!
@@ -868,6 +869,23 @@ class CustomLinear(nn.Linear):
         target_device = input.device
         target_dtype = input.dtype
         cache_key = (target_device.type, getattr(target_device, 'index', 0), target_dtype)
+        
+        # Memory-safe caching: check free memory before caching
+        # Only check periodically (every 100 calls) to avoid overhead
+        if not hasattr(self, '_ab_cache_check_counter'):
+            self._ab_cache_check_counter = 0
+            self._ab_cache_enabled = True  # Start with caching enabled
+        
+        self._ab_cache_check_counter += 1
+        if self._ab_cache_check_counter >= 100:
+            self._ab_cache_check_counter = 0
+            if target_device.type == 'cuda':
+                try:
+                    free_mem = torch.cuda.get_device_properties(target_device).total_memory - torch.cuda.memory_allocated(target_device)
+                    # Disable caching if less than 2GB free
+                    self._ab_cache_enabled = free_mem > 2 * 1024 * 1024 * 1024
+                except:
+                    pass
         
         # Apply each LoRA contribution directly
         lora_contribution = None
@@ -888,8 +906,11 @@ class CustomLinear(nn.Linear):
                 # Check cache for GPU copies of A, B
                 lora_cache_key = (cache_key, idx)
                 
+                # Use cache if available OR if caching is enabled and entry doesn't exist
+                use_cache = lora_cache_key in self._lora_ab_cache or self._ab_cache_enabled
+                
                 if lora_cache_key not in self._lora_ab_cache:
-                    # First time: transfer A, B to GPU and CACHE them
+                    # First time: transfer A, B to GPU
                     A = getattr(self, lora_diff_names[0])  # (out_features, rank)
                     B = getattr(self, lora_diff_names[1])  # (rank, in_features)
                     alpha_val = getattr(self, lora_diff_names[2])
@@ -901,29 +922,31 @@ class CustomLinear(nn.Linear):
                     A_gpu = A.to(target_device, target_dtype, non_blocking=True)
                     B_gpu = B.to(target_device, target_dtype, non_blocking=True)
                     
-                    # Pre-compute flattened/transposed versions to avoid redundant ops
+                    # Pre-compute flattened/transposed versions
                     A_flat = A_gpu.flatten(start_dim=1)  # (out_features, rank)
                     B_flat_t = B_gpu.flatten(start_dim=1).t()  # (in_features, rank)
                     
-                    # Cache everything needed for fast computation
-                    self._lora_ab_cache[lora_cache_key] = {
-                        'A_flat': A_flat,
-                        'B_flat_t': B_flat_t,
-                        'alpha': alpha,
-                    }
-                    del A_gpu, B_gpu  # Only need flattened versions
+                    # Only cache if memory is available
+                    if self._ab_cache_enabled:
+                        self._lora_ab_cache[lora_cache_key] = {
+                            'A_flat': A_flat,
+                            'B_flat_t': B_flat_t,
+                            'alpha': alpha,
+                        }
+                        if _LORA_TIMING_ENABLED:
+                            _lora_timing_stats['ab_cache_builds'] += 1
+                    # else: tensors will be used once and freed (no caching)
                     
-                    if _LORA_TIMING_ENABLED:
-                        _lora_timing_stats['ab_cache_builds'] += 1
+                    del A_gpu, B_gpu  # Only need flattened versions
                 else:
+                    # Cache hit - use cached tensors
+                    cached = self._lora_ab_cache[lora_cache_key]
+                    A_flat = cached['A_flat']
+                    B_flat_t = cached['B_flat_t']
+                    alpha = cached['alpha']
                     if _LORA_TIMING_ENABLED:
                         _lora_timing_stats['ab_cache_hits'] += 1
                 
-                # Fast path: use cached GPU tensors
-                cached = self._lora_ab_cache[lora_cache_key]
-                A_flat = cached['A_flat']
-                B_flat_t = cached['B_flat_t']
-                alpha = cached['alpha']
                 scale = strength_value * alpha
                 
                 # Compute B @ x: (batch*seq, in_features) @ (in_features, rank) = (batch*seq, rank)
@@ -939,15 +962,17 @@ class CustomLinear(nn.Linear):
                     lora_contribution.add_(ABx, alpha=scale)
                 
             else:
-                # Single tensor LoRA (pre-computed delta) - cache this too
+                # Single tensor LoRA (pre-computed delta) - cache this too if enabled
                 delta_cache_key = (cache_key, idx, 'delta')
                 
                 if delta_cache_key not in self._lora_ab_cache:
                     lora_diff = getattr(self, lora_diff_names)
                     delta_flat_t = lora_diff.to(target_device, target_dtype, non_blocking=True).flatten(start_dim=1).t()
-                    self._lora_ab_cache[delta_cache_key] = delta_flat_t
+                    if self._ab_cache_enabled:
+                        self._lora_ab_cache[delta_cache_key] = delta_flat_t
+                else:
+                    delta_flat_t = self._lora_ab_cache[delta_cache_key]
                 
-                delta_flat_t = self._lora_ab_cache[delta_cache_key]
                 delta_out = torch.mm(x_flat, delta_flat_t)
                 
                 if lora_contribution is None:
