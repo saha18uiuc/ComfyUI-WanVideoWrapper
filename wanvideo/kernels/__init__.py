@@ -46,6 +46,15 @@ from .integration import (
     enable_all_fused_ops,
     get_active_optimizations,
 )
+from .fast_ops import (
+    fused_silu_mul,
+    fused_layernorm,
+    fused_gelu_approximate,
+    fast_attention_scores,
+    optimized_linear,
+    FastOpsContext,
+    get_fast_ops_status,
+)
 
 __all__ = [
     # RoPE
@@ -80,4 +89,12 @@ __all__ = [
     'quick_setup_for_h100',
     'enable_all_fused_ops',
     'get_active_optimizations',
+    # Fast Ops (works with TeaCache)
+    'fused_silu_mul',
+    'fused_layernorm',
+    'fused_gelu_approximate',
+    'fast_attention_scores',
+    'optimized_linear',
+    'FastOpsContext',
+    'get_fast_ops_status',
 ]
