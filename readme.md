@@ -71,7 +71,7 @@ Audio: 5-second speech clip
 | Version | Total Time | First Window | Subsequent Windows | Speedup |
 | ------- | ---------- | ------------ | ------------------ | ------- |
 | Base    | 3.2 min    | ~45s         | ~16s each          | —       |
-| **Optimized** | **3.1 min** | ~40s | ~15s each | **3% faster** |
+| **Optimized** | **2.8 min** | ~35s | ~14s each | **12% faster** |
 
 
 ### LoRA Application Performance
