@@ -49,6 +49,11 @@ def print_lora_timing_stats():
     print(f"  Cache hits: {s['cache_hits']} (total: {s['total_cache_hit_time']:.4f}s)")
     print(f"  Cache moves: {s['cache_moves']} (total: {s['total_cache_move_time']:.4f}s)")
     
+    # GPU cache stats
+    gpu_cache_hits = s.get('gpu_cache_hits', 0)
+    if gpu_cache_hits > 0:
+        print(f"  GPU cache hits: {gpu_cache_hits} ✓ ULTRA FAST (no transfer!)")
+    
     # GPU vs CPU fallback stats
     if total_adds > 0:
         gpu_pct = gpu_adds / total_adds * 100
@@ -629,7 +634,7 @@ class CustomLinear(nn.Linear):
         
         Cache PERSISTS across device changes - we move it instead of rebuilding.
         """
-        # Check if we have a cached delta (always stored on CPU to save GPU memory)
+        # Check if we have a cached delta
         if (self._lora_cached_deltas is not None and 
             len(self._lora_cached_deltas) > 0 and
             self._lora_cache_dtype == weight.dtype):
@@ -637,15 +642,22 @@ class CustomLinear(nn.Linear):
             t0 = time.perf_counter() if _LORA_TIMING_ENABLED else 0
             cached_delta = self._lora_cached_deltas[0]
             
-            # FAST PATH: GPU addition with cached delta from CPU
             if weight.device.type == 'cuda':
-                # Move delta to GPU, add, free - no empty_cache() for speed!
-                gpu_delta = cached_delta.to(weight.device, weight.dtype, non_blocking=True)
-                result = weight + gpu_delta
-                del gpu_delta  # Free GPU memory immediately
-                
-                if _LORA_TIMING_ENABLED:
-                    _lora_timing_stats["gpu_additions"] = _lora_timing_stats.get("gpu_additions", 0) + 1
+                # Check if cache is already on GPU (FASTEST)
+                if cached_delta.device == weight.device:
+                    # ULTRA FAST PATH: Cache already on GPU, just add!
+                    result = weight + cached_delta
+                    if _LORA_TIMING_ENABLED:
+                        _lora_timing_stats["gpu_cache_hits"] = _lora_timing_stats.get("gpu_cache_hits", 0) + 1
+                else:
+                    # FIRST TIME: Move cache to GPU and KEEP it there
+                    gpu_delta = cached_delta.to(weight.device, weight.dtype, non_blocking=True)
+                    result = weight + gpu_delta
+                    # Keep on GPU for future calls (10GB headroom available!)
+                    self._lora_cached_deltas[0] = gpu_delta
+                    self._lora_cache_device = weight.device
+                    if _LORA_TIMING_ENABLED:
+                        _lora_timing_stats["gpu_additions"] = _lora_timing_stats.get("gpu_additions", 0) + 1
             else:
                 result = weight + cached_delta.to(weight.dtype)
             
