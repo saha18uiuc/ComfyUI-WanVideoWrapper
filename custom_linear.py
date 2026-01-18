@@ -637,32 +637,15 @@ class CustomLinear(nn.Linear):
             t0 = time.perf_counter() if _LORA_TIMING_ENABLED else 0
             cached_delta = self._lora_cached_deltas[0]
             
-            # Try GPU addition first, fall back to CPU if OOM
+            # FAST PATH: GPU addition with cached delta from CPU
             if weight.device.type == 'cuda':
-                try:
-                    # Clear fragmented memory first
-                    torch.cuda.empty_cache()
-                    
-                    # Move delta to GPU temporarily (don't store it there)
-                    gpu_delta = cached_delta.to(weight.device, weight.dtype, non_blocking=True)
-                    result = weight + gpu_delta
-                    del gpu_delta  # Free GPU memory immediately
-                    
-                    if _LORA_TIMING_ENABLED:
-                        _lora_timing_stats["gpu_additions"] = _lora_timing_stats.get("gpu_additions", 0) + 1
-                    
-                except torch.cuda.OutOfMemoryError:
-                    # OOM fallback: do addition on CPU
-                    torch.cuda.empty_cache()
-                    weight_cpu = weight.to('cpu')
-                    result_cpu = weight_cpu + cached_delta.to(weight_cpu.dtype)
-                    del weight_cpu
-                    result = result_cpu.to(weight.device)
-                    del result_cpu
-                    
-                    if _LORA_TIMING_ENABLED:
-                        _lora_timing_stats["cpu_fallbacks"] = _lora_timing_stats.get("cpu_fallbacks", 0) + 1
-                        print(f"[LoRA] CPU fallback triggered (GPU OOM)")
+                # Move delta to GPU, add, free - no empty_cache() for speed!
+                gpu_delta = cached_delta.to(weight.device, weight.dtype, non_blocking=True)
+                result = weight + gpu_delta
+                del gpu_delta  # Free GPU memory immediately
+                
+                if _LORA_TIMING_ENABLED:
+                    _lora_timing_stats["gpu_additions"] = _lora_timing_stats.get("gpu_additions", 0) + 1
             else:
                 result = weight + cached_delta.to(weight.dtype)
             
