@@ -28,35 +28,106 @@ script_directory = os.path.dirname(os.path.abspath(__file__))
 device = mm.get_torch_device()
 offload_device = mm.unet_offload_device()
 
+# =============================================================================
+# GPU Architecture Detection & Optimization
+# =============================================================================
+# Instead of hardcoding VRAM thresholds, detect GPU architecture properly:
+#   SM 8.0 = Ampere datacenter (A100) - excellent BF16, high bandwidth
+#   SM 8.6 = Ampere consumer (RTX 3090) - good BF16
+#   SM 8.9 = Ada Lovelace (L4, RTX 4090) - optimized for FP8/FP16, not BF16
+#   SM 9.0 = Hopper (H100) - excellent everything
+# =============================================================================
+
+class GPUConfig:
+    """Detected GPU configuration for architecture-aware optimizations."""
+    arch = "unknown"  # "ampere_dc", "ampere", "ada", "hopper", "unknown"
+    sm_version = (0, 0)
+    name = ""
+    vram_gb = 0
+    # Optimization flags based on architecture
+    use_bf16_reduced = False  # BF16 reduced precision matmul
+    use_scheduler_graphs = True  # CUDA graphs for scheduler step
+    use_fp16_accumulation = False  # FP16 accumulation (Ada optimization)
+    cudnn_benchmark = True
+
+GPU_CONFIG = GPUConfig()
+
+def _detect_gpu_config():
+    """Detect GPU architecture and set optimization flags."""
+    if not torch.cuda.is_available():
+        return
+    
+    try:
+        props = torch.cuda.get_device_properties(0)
+        GPU_CONFIG.sm_version = (props.major, props.minor)
+        GPU_CONFIG.name = props.name
+        GPU_CONFIG.vram_gb = props.total_memory / (1024**3)
+        
+        major, minor = GPU_CONFIG.sm_version
+        
+        if major == 8 and minor == 0:
+            # A100 (Ampere datacenter) - excellent BF16, high memory bandwidth
+            GPU_CONFIG.arch = "ampere_dc"
+            GPU_CONFIG.use_bf16_reduced = True
+            GPU_CONFIG.use_scheduler_graphs = True
+            GPU_CONFIG.use_fp16_accumulation = False
+        elif major == 8 and minor == 9:
+            # L4, RTX 4090 (Ada Lovelace) - optimized for FP8/FP16
+            GPU_CONFIG.arch = "ada"
+            GPU_CONFIG.use_bf16_reduced = False  # Ada's tensor cores prefer FP8/FP16
+            GPU_CONFIG.use_scheduler_graphs = False  # Limited VRAM, graphs add pressure
+            GPU_CONFIG.use_fp16_accumulation = True  # Ada excels at FP16
+        elif major == 9:
+            # H100 (Hopper) - excellent everything
+            GPU_CONFIG.arch = "hopper"
+            GPU_CONFIG.use_bf16_reduced = True
+            GPU_CONFIG.use_scheduler_graphs = True
+            GPU_CONFIG.use_fp16_accumulation = False
+        elif major == 8:
+            # Other Ampere (RTX 3090, A10, etc.)
+            GPU_CONFIG.arch = "ampere"
+            GPU_CONFIG.use_bf16_reduced = True
+            GPU_CONFIG.use_scheduler_graphs = GPU_CONFIG.vram_gb >= 20
+            GPU_CONFIG.use_fp16_accumulation = False
+        else:
+            # Older or unknown architecture - conservative settings
+            GPU_CONFIG.arch = "unknown"
+            GPU_CONFIG.use_bf16_reduced = False
+            GPU_CONFIG.use_scheduler_graphs = False
+            GPU_CONFIG.use_fp16_accumulation = False
+        
+        log.info(f"[GPU Config] {GPU_CONFIG.name} (SM {major}.{minor}, {GPU_CONFIG.vram_gb:.0f}GB)")
+        log.info(f"[GPU Config] Arch: {GPU_CONFIG.arch} | BF16: {GPU_CONFIG.use_bf16_reduced} | "
+                 f"Sched graphs: {GPU_CONFIG.use_scheduler_graphs} | FP16 accum: {GPU_CONFIG.use_fp16_accumulation}")
+    except Exception as e:
+        log.warning(f"[GPU Config] Detection failed: {e}")
+
+_detect_gpu_config()
+
 try:
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    # Enable cudnn.benchmark for faster convolutions (auto-tunes kernel selection)
-    torch.backends.cudnn.benchmark = True
-    # Disable cudnn.deterministic for speed (only affects reproducibility)
+    torch.backends.cudnn.benchmark = GPU_CONFIG.cudnn_benchmark
     torch.backends.cudnn.deterministic = False
     if hasattr(torch, "set_float32_matmul_precision"):
         torch.set_float32_matmul_precision("high")
     
-    # Enable Flash SDP when available (works well on both L4 and A100)
+    # Flash SDP works well on all modern GPUs
     if hasattr(torch.backends.cuda, 'enable_flash_sdp'):
         torch.backends.cuda.enable_flash_sdp(True)
     if hasattr(torch.backends.cuda, 'enable_mem_efficient_sdp'):
         torch.backends.cuda.enable_mem_efficient_sdp(True)
     
-    # BF16 reduced precision - ONLY on high-VRAM GPUs (A100 40/80GB, H100)
-    # On L4 (22GB), this can cause slowdowns due to different tensor core optimization
-    if torch.cuda.is_available() and hasattr(torch.backends.cuda.matmul, 'allow_bf16_reduced_precision_reduction'):
-        try:
-            total_vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-            if total_vram_gb >= 40:  # A100 40GB+, H100
-                torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
-        except Exception:
-            pass
+    # Architecture-specific matmul optimizations
+    if hasattr(torch.backends.cuda.matmul, 'allow_bf16_reduced_precision_reduction'):
+        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = GPU_CONFIG.use_bf16_reduced
     
-    # CUDA memory optimization - reduces fragmentation and OOM risk
-    # Note: This is a fallback if not set in environment before torch import
-    # Set memory allocation config (use both old and new names for compatibility)
+    # Ada Lovelace (L4) specific: enable FP16 accumulation for faster matmuls
+    if GPU_CONFIG.use_fp16_accumulation:
+        if hasattr(torch.backends.cuda.matmul, 'allow_fp16_reduced_precision_reduction'):
+            torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
+    
+    # CUDA memory optimization
     alloc_conf = "expandable_segments:True,garbage_collection_threshold:0.8"
     if "PYTORCH_ALLOC_CONF" not in os.environ:
         os.environ["PYTORCH_ALLOC_CONF"] = alloc_conf
@@ -1481,7 +1552,7 @@ class WanVideoSampler:
             log.info("CUDA graphs active for scheduler step.")
 
         def disable_transformer_graphs(reason):
-            """Disable transformer graphs. Keep scheduler graphs only on high-VRAM GPUs (>=40GB)."""
+            """Disable transformer graphs. Keep scheduler graphs based on GPU architecture."""
             nonlocal graph_state, graph_runners, scheduler_graph_enabled, scheduler_graph_runner, scheduler_graph_flipped
             if graph_state["enabled"]:
                 log.warning(f"Disabling transformer CUDA graphs: {reason}")
@@ -1492,21 +1563,16 @@ class WanVideoSampler:
                     runner.release()
                 graph_runners[key] = None
             
-            # Only keep scheduler graphs on high-VRAM GPUs (A100 80GB, H100, etc.)
-            # On lower-VRAM GPUs (L4 22GB), scheduler graphs add overhead
-            try:
-                total_vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-                if total_vram_gb < 40 and scheduler_graph_enabled:
-                    log.info(f"Also disabling scheduler graphs (GPU has {total_vram_gb:.0f}GB VRAM)")
-                    scheduler_graph_enabled = False
-                    if scheduler_graph_runner is not None and hasattr(scheduler_graph_runner, "release"):
-                        scheduler_graph_runner.release()
-                    if scheduler_graph_flipped is not None and hasattr(scheduler_graph_flipped, "release"):
-                        scheduler_graph_flipped.release()
-                    scheduler_graph_runner = None
-                    scheduler_graph_flipped = None
-            except Exception:
-                pass
+            # Use GPU_CONFIG to decide on scheduler graphs (architecture-aware)
+            if not GPU_CONFIG.use_scheduler_graphs and scheduler_graph_enabled:
+                log.info(f"Also disabling scheduler graphs ({GPU_CONFIG.arch} architecture)")
+                scheduler_graph_enabled = False
+                if scheduler_graph_runner is not None and hasattr(scheduler_graph_runner, "release"):
+                    scheduler_graph_runner.release()
+                if scheduler_graph_flipped is not None and hasattr(scheduler_graph_flipped, "release"):
+                    scheduler_graph_flipped.release()
+                scheduler_graph_runner = None
+                scheduler_graph_flipped = None
         
         def disable_graphs(reason):
             """Disable ALL graphs (transformer + scheduler)."""
