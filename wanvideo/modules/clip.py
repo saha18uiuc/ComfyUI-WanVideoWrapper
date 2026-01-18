@@ -10,9 +10,9 @@ import torchvision.transforms as T
 
 from .attention import attention
 
-# Import JIT-fused SiLU*mul
+# Import fused SiLU*mul - uses CUDA kernel when available
 try:
-    from ..kernels.jit_ops import fused_silu_mul
+    from ..kernels import fused_silu_mul
     _HAS_FUSED_SILU = True
 except ImportError:
     _HAS_FUSED_SILU = False

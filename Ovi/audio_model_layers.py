@@ -2,9 +2,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# Import JIT-fused SiLU*mul
+# Import fused SiLU*mul - uses CUDA kernel when available
 try:
-    from ..wanvideo.kernels.jit_ops import fused_silu_mul
+    from ..wanvideo.kernels import fused_silu_mul
     _HAS_FUSED_SILU = True
 except ImportError:
     _HAS_FUSED_SILU = False

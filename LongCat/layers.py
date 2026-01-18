@@ -7,9 +7,9 @@ from einops import rearrange
 from ..wanvideo.modules.model import WanRMSNorm, attention
 from ..multitalk.multitalk import RotaryPositionalEmbedding1D, normalize_and_scale
 
-# Import JIT-fused SiLU*mul for ~5-10% speedup in FFN
+# Import fused SiLU*mul - uses CUDA kernel when available, else JIT
 try:
-    from ..wanvideo.kernels.jit_ops import fused_silu_mul
+    from ..wanvideo.kernels import fused_silu_mul
     _HAS_FUSED_SILU = True
 except ImportError:
     _HAS_FUSED_SILU = False
