@@ -1,4 +1,4 @@
-# --- PUNICA-STYLE OPTIMIZED RUN SCRIPT ---
+# --- MAXIMUM SPEED OPTIMIZED RUN SCRIPT ---
 import os
 import sys
 import subprocess
@@ -34,16 +34,28 @@ os.environ["MAX_FRAMES"] = str(MAX_FRAMES)
 os.environ["WIDTH"] = "512"
 os.environ["HEIGHT"] = "512"
 os.environ["AUDIO_SCALE_STRENGTH"] = "2"
-os.environ["MAX_STEPS"] = "3"
 os.environ["FRAME_WINDOW_SIZE"] = "25"
 
 # ============================================================
-# STEP 4: PUNICA-STYLE LORA (KEY OPTIMIZATION!)
+# STEP 4: SPEED OPTIMIZATIONS
 # ============================================================
-# This computes W@x + A@(B@x) instead of (W+delta)@x
-# A,B are cached on GPU after first transfer - eliminates ~30,000 redundant CPU->GPU transfers!
+
+# 1. REDUCE DIFFUSION STEPS: 3 -> 2 (saves ~33% sampling time!)
+os.environ["MAX_STEPS"] = "2"
+
+# 2. REDUCE WINDOW OVERLAP: 25 -> 5 frames overlap
+#    This reduces windows from 8 to ~5, saving ~3 windows worth of compute
+#    Formula: windows = total_frames / (window_size - overlap) + 1
+#    120 / (25-5) + 1 = 7 windows (vs 8 with overlap=9)
+os.environ["MOTION_FRAME"] = "5"
+
+# 3. PUNICA-STYLE LORA (already optimized)
 os.environ["WAN_LORA_ONTHEFLY"] = "1"
-os.environ["WAN_LORA_TIMING"] = "1"  # Show cache stats
+os.environ["WAN_LORA_TIMING"] = "1"
+
+# 4. OPTIONAL: torch.compile (experimental - has warmup cost)
+# Uncomment to try - might help on subsequent runs
+# os.environ["WAN_TORCH_COMPILE"] = "1"
 
 # ============================================================
 # STEP 5: Models
@@ -66,22 +78,17 @@ os.environ["REF_IMAGE"] = str(ref_image)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 print("=" * 60)
-print("PUNICA-STYLE OPTIMIZED RUN (WITH A/B GPU CACHING)")
+print("MAXIMUM SPEED OPTIMIZATION RUN")
 print("=" * 60)
 print(f"512x512 @ 5s, {MAX_FRAMES} frames")
 print()
-print("KEY OPTIMIZATION:")
-print("  Instead of transferring A,B 30,000+ times (every forward pass),")
-print("  we cache them on GPU after first use (~1262 transfers total).")
+print("SPEED OPTIMIZATIONS:")
+print(f"  ✓ Reduced steps: 3 → 2 (saves ~33% sampling time)")
+print(f"  ✓ Reduced overlap: MOTION_FRAME=5 (fewer windows)")
+print(f"  ✓ Punica-style LoRA with A/B GPU caching")
+print(f"  ✓ torch.addmm fused operations")
 print()
-print("Enabled:")
-print("  ✓ Punica-style: W@x + A@(B@x) - no large delta")
-print("  ✓ A/B GPU caching - eliminates redundant transfers")
-print("  ✓ Pre-computed flatten/transpose - faster matmuls")
-print("  ✓ non_blocking transfers - async overlap")
-print("  ✓ In-place ops (mul_, add_) - less memory alloc")
-print("  ✓ CUDA fused kernels (RMSNorm, SiLU)")
-print("  ✓ TF32 + cudnn.benchmark")
+print("EXPECTED: ~5-6 minutes (down from 7.8 min)")
 print("=" * 60)
 
 # Pull latest optimizations
@@ -90,16 +97,9 @@ sp.run(["git", "-C", str(COMFY_DIR / "custom_nodes" / "ComfyUI-WanVideoWrapper")
 
 t0 = time.perf_counter()
 try:
-    completed = subprocess.run(
-        ["python", str(WORKFLOW_PATH)], 
-        cwd=str(WORKFLOW_PATH.parent), 
-        check=True, 
-        text=True, 
-        capture_output=True
-    )
+    completed = subprocess.run(["python", str(WORKFLOW_PATH)], cwd=str(WORKFLOW_PATH.parent), check=True, text=True, capture_output=True)
     print(completed.stdout)
-    if completed.stderr: 
-        print(completed.stderr)
+    if completed.stderr: print(completed.stderr)
 except subprocess.CalledProcessError as e:
     print(f"FAILED: {e.returncode}")
     print(e.stdout or "")
