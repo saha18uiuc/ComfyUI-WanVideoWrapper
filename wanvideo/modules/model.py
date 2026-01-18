@@ -13,12 +13,6 @@ try:
 except:
     pass
 
-# Triton-fused RMSNorm - saves ~4 kernel launches per norm call
-try:
-    from ..kernels.rmsnorm_triton import triton_rms_norm
-    _HAS_TRITON_RMSNORM = True
-except ImportError:
-    _HAS_TRITON_RMSNORM = False
 
 from .attention import attention
 import numpy as np
@@ -311,9 +305,6 @@ class WanRMSNorm(nn.Module):
         if use_chunked:
             return self.forward_chunked(x, num_chunks)
         else:
-            # Use Triton-fused kernel when available (saves ~4 kernel launches)
-            if _HAS_TRITON_RMSNORM and x.is_cuda:
-                return triton_rms_norm(x, self.weight, self.eps)
             return self._norm(x.to(self.weight.dtype)) * self.weight
 
     def _norm(self, x):
@@ -330,12 +321,8 @@ class WanRMSNorm(nn.Module):
             end_idx = start_idx + size
             chunk = x[:, start_idx:end_idx, :]
             
-            # Use Triton kernel per chunk when available
-            if _HAS_TRITON_RMSNORM and chunk.is_cuda:
-                output[:, start_idx:end_idx, :] = triton_rms_norm(chunk, self.weight, self.eps)
-            else:
-                norm_factor = torch.rsqrt(chunk.pow(2).mean(dim=-1, keepdim=True) + self.eps)
-                output[:, start_idx:end_idx, :] = chunk * norm_factor.to(chunk.dtype) * self.weight
+            norm_factor = torch.rsqrt(chunk.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+            output[:, start_idx:end_idx, :] = chunk * norm_factor.to(chunk.dtype) * self.weight
 
             start_idx = end_idx
             

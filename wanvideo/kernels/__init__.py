@@ -1,12 +1,8 @@
 # Kernel optimizations for WanVideo
-# Only includes PROVEN optimizations with minimal overhead
+# Only includes PROVEN optimizations that ALWAYS help on L4 and A100
 
-# JIT-compiled fused operations (torch.jit.script based - zero overhead)
+# JIT-compiled fused operations (torch.jit.script based)
+# - Zero overhead after first call (JIT compilation)
+# - PyTorch automatically fuses element-wise ops
+# - Always enabled, no flags needed
 from .jit_ops import fused_silu_mul, fused_rope_apply, fused_ln_modulate
-
-# Triton RMSNorm kernel - fuses 4-5 operations into 1 kernel
-try:
-    from .rmsnorm_triton import triton_rms_norm, validate_rmsnorm_kernel
-except ImportError:
-    # Triton not available
-    pass
