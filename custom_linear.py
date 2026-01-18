@@ -2,6 +2,7 @@ import os
 import time
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from accelerate import init_empty_weights
 from .gguf.gguf_utils import GGUFParameter, dequantize_gguf_tensor
 try:
@@ -81,7 +82,13 @@ LORA_LAZY = os.environ.get("WAN_LORA_LAZY", "0").strip().lower() in ("1", "true"
 # LORA_PREMERGE: Old approach - builds cache all at once (OOM risk)
 LORA_PREMERGE = os.environ.get("WAN_LORA_PREMERGE", "0").strip().lower() in ("1", "true", "yes")
 
-if LORA_STREAMING:
+# LORA_ONTHEFLY: Punica-style - compute W@x + A@(B@x) directly, no delta storage
+# This avoids large CPU→GPU transfers by using small A,B matrices
+LORA_ONTHEFLY = os.environ.get("WAN_LORA_ONTHEFLY", "0").strip().lower() in ("1", "true", "yes")
+
+if LORA_ONTHEFLY:
+    print(f"[WanVideo LoRA] ON-THE-FLY mode ENABLED - Punica-style A@(B@x), no delta transfer!")
+elif LORA_STREAMING:
     print(f"[WanVideo LoRA] Streaming merge ENABLED - incremental cache build")
 elif LORA_LAZY:
     print(f"[WanVideo LoRA] Lazy mode ENABLED - compute on-demand")
@@ -823,6 +830,101 @@ class CustomLinear(nn.Linear):
         # Move only the final result to GPU
         return weight + merged_delta.to(weight.device, weight.dtype)
     
+    def _apply_lora_onthefly(self, input, weight, bias):
+        """
+        PUNICA-STYLE: Compute W@x + sum(scale * A @ (B @ x)) directly.
+        
+        Instead of materializing delta = A @ B (large), we compute:
+        - out = W @ x (main matmul)
+        - lora_out = A @ (B @ x) (two small matmuls)
+        
+        This avoids:
+        - Computing/storing full delta
+        - CPU→GPU transfer of large delta
+        - Only needs small A, B matrices on GPU
+        
+        Memory: A is (out_features, rank), B is (rank, in_features)
+        vs delta is (out_features, in_features) - much larger!
+        """
+        # Main forward pass
+        out = F.linear(input, weight, bias)
+        
+        # Apply each LoRA contribution directly
+        lora_contribution = None
+        
+        for idx, lora_diff_names in enumerate(self.lora_diffs):
+            lora_strength = self._get_lora_strength(idx)
+            if isinstance(lora_strength, torch.Tensor):
+                strength_value = lora_strength.item() if lora_strength.numel() == 1 else lora_strength.mean().item()
+            else:
+                strength_value = float(lora_strength)
+            
+            if abs(strength_value) < 1e-8:
+                continue
+            
+            if isinstance(lora_diff_names, tuple):
+                # A is lora_diff_0: (out_features, rank) or similar
+                # B is lora_diff_1: (rank, in_features) or similar
+                A = getattr(self, lora_diff_names[0])  # down projection
+                B = getattr(self, lora_diff_names[1])  # up projection  
+                alpha_val = getattr(self, lora_diff_names[2])
+                
+                rank = B.shape[0]
+                alpha = (float(alpha_val) / rank) if (alpha_val is not None and rank != 0) else 1.0
+                scale = strength_value * alpha
+                
+                # Move A, B to GPU (small tensors!)
+                A_gpu = A.to(input.device, input.dtype)
+                B_gpu = B.to(input.device, input.dtype)
+                
+                # Compute B @ x first (reduces dimension to rank)
+                # input shape: (batch, seq, in_features)
+                # B shape: (rank, in_features) -> need to flatten and reshape
+                
+                # Flatten input for matmul
+                orig_shape = input.shape
+                x_flat = input.view(-1, orig_shape[-1])  # (batch*seq, in_features)
+                
+                # B @ x: (batch*seq, in_features) @ (in_features, rank) = (batch*seq, rank)
+                B_flat = B_gpu.flatten(start_dim=1).t()  # (in_features, rank)
+                Bx = x_flat @ B_flat  # (batch*seq, rank)
+                
+                # A @ (B @ x): (batch*seq, rank) @ (rank, out_features) = (batch*seq, out_features)
+                A_flat = A_gpu.flatten(start_dim=1)  # (out_features, rank)
+                ABx = Bx @ A_flat.t()  # (batch*seq, out_features)
+                
+                # Reshape back
+                ABx = ABx.view(*orig_shape[:-1], -1) * scale  # (batch, seq, out_features)
+                
+                # Accumulate
+                if lora_contribution is None:
+                    lora_contribution = ABx
+                else:
+                    lora_contribution = lora_contribution + ABx
+                
+                # Free GPU memory
+                del A_gpu, B_gpu, Bx, ABx
+            else:
+                # Single tensor LoRA (pre-computed delta)
+                lora_diff = getattr(self, lora_diff_names)
+                delta_gpu = lora_diff.to(input.device, input.dtype)
+                
+                orig_shape = input.shape
+                x_flat = input.view(-1, orig_shape[-1])
+                delta_out = x_flat @ delta_gpu.flatten(start_dim=1).t()
+                delta_out = delta_out.view(*orig_shape[:-1], -1) * strength_value
+                
+                if lora_contribution is None:
+                    lora_contribution = delta_out
+                else:
+                    lora_contribution = lora_contribution + delta_out
+                
+                del delta_gpu, delta_out
+        
+        if lora_contribution is not None:
+            out = out + lora_contribution
+        
+        return out
 
     def _compute_grouped_lora(self, input, weight):
         if not grouped_lora_available():
@@ -885,6 +987,11 @@ class CustomLinear(nn.Linear):
                 weight = weight * self.scale_weight
             else:
                 input = input * self.scale_weight
+
+        # PUNICA-STYLE ON-THE-FLY: Compute W@x + A@(B@x) directly
+        # This avoids large delta transfers - only transfers small A, B matrices
+        if LORA_ONTHEFLY and getattr(self, "lora_diffs", None) and len(self.lora_diffs) > 0:
+            return self._apply_lora_onthefly(input, weight, bias)
 
         # Fast path: check if grouped LoRA is possible (cache the tuple check result)
         if (self.grouped_lora_enabled and weight.is_cuda and 
