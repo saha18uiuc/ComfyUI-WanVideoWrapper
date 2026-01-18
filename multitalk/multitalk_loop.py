@@ -480,4 +480,12 @@ def multitalk_loop(self, **kwargs):
         torch.cuda.reset_peak_memory_stats(device)
     except:
         pass
+    
+    # Print LoRA timing stats if enabled
+    try:
+        from ..custom_linear import print_lora_timing_stats
+        print_lora_timing_stats()
+    except:
+        pass
+    
     return {"video": gen_video_samples.permute(1, 2, 3, 0), "output_path": output_path},

@@ -40,10 +40,24 @@ def print_lora_timing_stats():
         print("[LoRA Timing] Timing not enabled. Set WAN_LORA_TIMING=1")
         return
     s = _lora_timing_stats
+    gpu_adds = s.get('gpu_additions', 0)
+    cpu_falls = s.get('cpu_fallbacks', 0)
+    total_adds = gpu_adds + cpu_falls
+    
     print(f"\n[LoRA Timing Statistics]")
     print(f"  Cache builds: {s['cache_builds']} (total: {s['total_cache_build_time']:.2f}s)")
     print(f"  Cache hits: {s['cache_hits']} (total: {s['total_cache_hit_time']:.4f}s)")
     print(f"  Cache moves: {s['cache_moves']} (total: {s['total_cache_move_time']:.4f}s)")
+    
+    # GPU vs CPU fallback stats
+    if total_adds > 0:
+        gpu_pct = gpu_adds / total_adds * 100
+        print(f"  GPU additions: {gpu_adds}/{total_adds} ({gpu_pct:.1f}%) ✓ FAST PATH")
+        if cpu_falls > 0:
+            print(f"  CPU fallbacks: {cpu_falls}/{total_adds} ({100-gpu_pct:.1f}%) ⚠ SLOW PATH")
+        else:
+            print(f"  CPU fallbacks: 0 (none needed - all GPU!) ✓")
+    
     if s['cache_hits'] > 0:
         avg_hit = s['total_cache_hit_time'] / s['cache_hits'] * 1000
         print(f"  Avg cache hit: {avg_hit:.3f}ms")
@@ -634,6 +648,9 @@ class CustomLinear(nn.Linear):
                     result = weight + gpu_delta
                     del gpu_delta  # Free GPU memory immediately
                     
+                    if _LORA_TIMING_ENABLED:
+                        _lora_timing_stats["gpu_additions"] = _lora_timing_stats.get("gpu_additions", 0) + 1
+                    
                 except torch.cuda.OutOfMemoryError:
                     # OOM fallback: do addition on CPU
                     torch.cuda.empty_cache()
@@ -642,6 +659,10 @@ class CustomLinear(nn.Linear):
                     del weight_cpu
                     result = result_cpu.to(weight.device)
                     del result_cpu
+                    
+                    if _LORA_TIMING_ENABLED:
+                        _lora_timing_stats["cpu_fallbacks"] = _lora_timing_stats.get("cpu_fallbacks", 0) + 1
+                        print(f"[LoRA] CPU fallback triggered (GPU OOM)")
             else:
                 result = weight + cached_delta.to(weight.dtype)
             
