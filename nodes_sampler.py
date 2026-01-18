@@ -38,6 +38,16 @@ try:
     if hasattr(torch, "set_float32_matmul_precision"):
         torch.set_float32_matmul_precision("high")
     
+    # Enable BF16 reduced precision reduction (faster matmuls on A100/H100)
+    if hasattr(torch.backends.cuda.matmul, 'allow_bf16_reduced_precision_reduction'):
+        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
+    
+    # Enable Flash SDP when available (faster attention on A100+)
+    if hasattr(torch.backends.cuda, 'enable_flash_sdp'):
+        torch.backends.cuda.enable_flash_sdp(True)
+    if hasattr(torch.backends.cuda, 'enable_mem_efficient_sdp'):
+        torch.backends.cuda.enable_mem_efficient_sdp(True)
+    
     # CUDA memory optimization - reduces fragmentation and OOM risk
     # Note: This is a fallback if not set in environment before torch import
     # Set memory allocation config (use both old and new names for compatibility)

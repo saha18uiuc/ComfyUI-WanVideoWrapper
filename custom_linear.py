@@ -854,10 +854,10 @@ class CustomLinear(nn.Linear):
         
         KEY OPTIMIZATIONS:
         1. Cache A and B on GPU after first transfer (eliminates 30,000+ transfers)
-        2. No memory checks (removed overhead from hot path)
-        3. Avoid .item() calls (prevents CUDA sync)
-        4. Local variable caching (reduces attribute lookups)
-        5. Fused addmm operations (single kernel instead of two)
+        2. Cache strength tensor references (avoids getattr+fstring overhead)
+        3. Use dtype directly as cache key (no tuple creation)
+        4. Fused addmm operations (single kernel instead of two)
+        5. Minimal branching in hot loop
         """
         # Main forward pass - this is the bulk of compute
         out = F.linear(input, weight, bias)
@@ -867,51 +867,47 @@ class CustomLinear(nn.Linear):
         if not lora_diffs:
             return out
         
-        # Initialize GPU cache for LoRA matrices if not exists
-        ab_cache = getattr(self, '_lora_ab_cache', None)
+        # Initialize/get caches (avoid repeated hasattr/getattr)
+        ab_cache = self.__dict__.get('_lora_ab_cache')
         if ab_cache is None:
             ab_cache = {}
             self._lora_ab_cache = ab_cache
         
-        target_device = input.device
+        # Cache strength tensor REFERENCES (one-time per layer, avoids 5000+ getattr calls)
+        strength_cache = self.__dict__.get('_strength_tensor_refs')
+        if strength_cache is None:
+            strength_cache = [getattr(self, f"_lora_strength_{i}") for i in range(len(lora_diffs))]
+            self._strength_tensor_refs = strength_cache
+        
         target_dtype = input.dtype
-        # Use simpler cache key (device index is usually 0)
-        cache_key = (target_dtype,)
         
         # Flatten input once, reuse for all LoRAs
         orig_shape = input.shape
         x_flat = input.view(-1, orig_shape[-1])
         
-        # Pre-compute output shape for lora_contribution
-        out_features = weight.shape[0]
-        batch_seq = x_flat.shape[0]
-        
         lora_contribution = None
         
-        # Use local variable for timing flag (avoid repeated global lookup)
+        # Local refs for hot loop (avoid repeated lookups)
         timing_enabled = _LORA_TIMING_ENABLED
         timing_stats = _lora_timing_stats if timing_enabled else None
+        scheduled_flags = self._lora_strength_is_scheduled
+        step_tensor = self._step
+        target_device = input.device
         
         for idx, lora_diff_names in enumerate(lora_diffs):
-            # Get strength - avoid .item() by keeping as tensor when possible
-            strength_tensor = getattr(self, f"_lora_strength_{idx}")
-            if self._lora_strength_is_scheduled[idx]:
-                strength_tensor = strength_tensor.index_select(0, self._step).squeeze(0)
+            # Get strength from cached reference (fast list access vs getattr)
+            strength_tensor = strength_cache[idx]
+            if scheduled_flags[idx]:
+                strength_tensor = strength_tensor.index_select(0, step_tensor).squeeze(0)
             
-            # Skip if zero strength (use tensor comparison to avoid sync)
-            if strength_tensor.numel() == 1:
-                # For single-element tensors, compare directly
-                if (strength_tensor.abs() < 1e-8).item():
-                    continue
-                strength_value = strength_tensor.item()
-            else:
-                strength_value = strength_tensor.mean().item()
-                if abs(strength_value) < 1e-8:
-                    continue
+            # Get scalar value - single .item() call
+            strength_value = strength_tensor.item() if strength_tensor.numel() == 1 else strength_tensor.mean().item()
+            if abs(strength_value) < 1e-8:
+                continue
             
             if isinstance(lora_diff_names, tuple):
-                # Check cache for GPU copies of A, B
-                lora_cache_key = (cache_key, idx)
+                # Use dtype directly as key component (no tuple creation in hot path)
+                lora_cache_key = (target_dtype, idx)
                 
                 cached = ab_cache.get(lora_cache_key)
                 if cached is None:
@@ -927,19 +923,17 @@ class CustomLinear(nn.Linear):
                     A_flat = A.to(target_device, target_dtype, non_blocking=True).flatten(start_dim=1)
                     B_flat_t = B.to(target_device, target_dtype, non_blocking=True).flatten(start_dim=1).t()
                     
-                    # Always cache (no memory check - it was causing overhead)
                     ab_cache[lora_cache_key] = (A_flat, B_flat_t, alpha)
                     if timing_enabled:
                         timing_stats['ab_cache_builds'] += 1
                 else:
-                    # Cache hit
                     A_flat, B_flat_t, alpha = cached
                     if timing_enabled:
                         timing_stats['ab_cache_hits'] += 1
                 
                 scale = strength_value * alpha
                 
-                # Compute B @ x: (batch*seq, in_features) @ (in_features, rank) = (batch*seq, rank)
+                # Compute B @ x then A @ (B @ x)
                 Bx = torch.mm(x_flat, B_flat_t)
                 
                 # Fused addmm for matmul+add
