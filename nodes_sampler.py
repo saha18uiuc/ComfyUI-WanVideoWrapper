@@ -1474,7 +1474,20 @@ class WanVideoSampler:
         if scheduler_graph_enabled:
             log.info("CUDA graphs active for scheduler step.")
 
+        def disable_transformer_graphs(reason):
+            """Disable only transformer graphs, keep scheduler graphs enabled."""
+            nonlocal graph_state, graph_runners
+            if graph_state["enabled"]:
+                log.warning(f"Disabling transformer CUDA graphs: {reason}")
+            graph_state["enabled"] = False
+            for key in ("cond", "uncond"):
+                runner = graph_runners.get(key)
+                if runner is not None and hasattr(runner, "release"):
+                    runner.release()
+                graph_runners[key] = None
+        
         def disable_graphs(reason):
+            """Disable ALL graphs (transformer + scheduler)."""
             nonlocal graph_state, graph_runners, scheduler_graph_runner, scheduler_graph_flipped, scheduler_graph_enabled
             if graph_state["enabled"] or scheduler_graph_enabled:
                 log.warning(f"Disabling CUDA graphs: {reason}")
@@ -1824,7 +1837,8 @@ class WanVideoSampler:
                     dynamic_pipeline = dynamic_pipeline or multitalk_audio_input is not None or humo_audio_input is not None
                     dynamic_pipeline = dynamic_pipeline or dual_control_in is not None or scail_data_in is not None
                     if dynamic_pipeline:
-                        disable_graphs("variable-length context/audio inputs")
+                        # Only disable transformer graphs - scheduler graphs have static shapes and can stay enabled!
+                        disable_transformer_graphs("variable-length context/audio inputs")
 
                 base_params = {
                     'x': [z], # latent
