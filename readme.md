@@ -64,7 +64,7 @@ Audio: 5-second speech clip
 | Version | Total Time | First Window | Subsequent Windows | Speedup |
 | ------- | ---------- | ------------ | ------------------ | ------- |
 | Base    | 7.8 min    | ~2:30        | ~22s each          | —       |
-| **Optimized** | **6.5 min** | ~2:05 | ~19s each | **17% faster** |
+| **Optimized** | **6.4 min** | ~2:05 | ~19s each | **18% faster** |
 
 #### NVIDIA A100 (80GB VRAM)
 
