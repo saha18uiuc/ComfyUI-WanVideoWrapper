@@ -16,6 +16,8 @@ MERGE_STATIC_LORA = os.environ.get("WAN_MERGE_STATIC_LORA", "1").strip().lower()
 # Pre-merge LoRA: combine all patches into a single delta at cache build time
 # Uses O(weight_size) memory instead of O(num_patches * weight_size)
 LORA_PREMERGE = os.environ.get("WAN_LORA_PREMERGE", "1").strip().lower() in ("1", "true", "yes")
+# Store merged delta on CPU to save GPU memory (default ON for memory safety)
+LORA_PREMERGE_CPU = os.environ.get("WAN_LORA_PREMERGE_CPU", "1").strip().lower() in ("1", "true", "yes")
 
 
 @torch.library.custom_op("wanvideo::apply_lora", mutates_args=())
@@ -257,7 +259,11 @@ class CustomLinear(nn.Linear):
         instead of O(num_patches * weight_size).
         """
         if self._lora_cached_deltas is not None:
-            if self._lora_cache_device == weight.device and self._lora_cache_dtype == weight.dtype:
+            # For CPU-cached pre-merge, just check dtype (we'll move to GPU during forward)
+            if LORA_PREMERGE and LORA_PREMERGE_CPU:
+                if self._lora_cache_dtype == weight.dtype:
+                    return
+            elif self._lora_cache_device == weight.device and self._lora_cache_dtype == weight.dtype:
                 return
         
         # Determine compute dtype for FP8 models
@@ -316,9 +322,12 @@ class CustomLinear(nn.Linear):
                     else:
                         merged_delta.add_(lora_diff, alpha=scale)
             
-            # Store just the single merged delta
+            # Store just the single merged delta (on CPU if memory-safe mode)
             if merged_delta is not None:
-                self._lora_cached_deltas = [merged_delta.to(weight.dtype).contiguous()]
+                merged_delta = merged_delta.to(weight.dtype).contiguous()
+                if LORA_PREMERGE_CPU:
+                    merged_delta = merged_delta.cpu()
+                self._lora_cached_deltas = [merged_delta]
             else:
                 self._lora_cached_deltas = []
         else:
@@ -340,8 +349,12 @@ class CustomLinear(nn.Linear):
                     patch = lora_diff.to(weight.device, weight.dtype).contiguous()
                     cached.append((patch, 1.0))
             self._lora_cached_deltas = cached
-                    
-        self._lora_cache_device = weight.device
+        
+        # Track where cache is stored (may be CPU for memory safety)
+        if LORA_PREMERGE and LORA_PREMERGE_CPU:
+            self._lora_cache_device = torch.device('cpu')
+        else:
+            self._lora_cache_device = weight.device
         self._lora_cache_dtype = weight.dtype
 
     def _clear_lora_state(self):
@@ -473,8 +486,10 @@ class CustomLinear(nn.Linear):
 
         if LORA_PREMERGE:
             # Pre-merge mode: single merged delta, already scaled
-            # Just add it to the weight - super fast!
             merged_delta = self._lora_cached_deltas[0]
+            # Move from CPU to GPU if needed (for memory-safe mode)
+            if merged_delta.device != weight.device:
+                merged_delta = merged_delta.to(weight.device, non_blocking=True)
             return weight + merged_delta
         else:
             # Original mode: apply each cached patch with its strength
