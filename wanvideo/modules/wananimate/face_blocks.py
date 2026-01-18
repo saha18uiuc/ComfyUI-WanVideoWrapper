@@ -4,6 +4,9 @@ from einops import rearrange
 import torch.nn.functional as F
 from ..attention import attention
 
+# Check for PyTorch's fused RMSNorm (2.4+)
+_HAS_FUSED_RMSNORM = hasattr(F, 'rms_norm')
+
 class CausalConv1d(nn.Module):
     def __init__(self, chan_in, chan_out, kernel_size=3, stride=1, dilation=1, pad_mode="replicate", **kwargs):
         super().__init__()
@@ -68,6 +71,7 @@ class FaceEncoder(nn.Module):
 class RMSNorm(nn.Module):
     def __init__(self, dim, elementwise_affine=True, eps=1e-6, device=None, dtype=None):
         super().__init__()
+        self.dim = dim
         self.eps = eps
         if elementwise_affine:
             self.weight = nn.Parameter(torch.ones(dim, device=device, dtype=dtype))
@@ -76,6 +80,10 @@ class RMSNorm(nn.Module):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
     def forward(self, x):
+        # Use PyTorch's fused CUDA kernel when available (2.4+)
+        if _HAS_FUSED_RMSNORM and hasattr(self, "weight"):
+            return F.rms_norm(x, (self.dim,), self.weight, self.eps)
+        # Fallback to manual implementation
         output = self._norm(x.float()).type_as(x)
         if hasattr(self, "weight"):
             output = output * self.weight

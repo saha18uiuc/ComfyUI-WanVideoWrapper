@@ -1824,8 +1824,24 @@ class WanVideoModelLoader:
 
         if 'transformer_options' not in patcher.model_options:
             patcher.model_options['transformer_options'] = {}
-        patcher.model_options["transformer_options"]["block_swap_args"] = block_swap_args
-        patcher.model_options["transformer_options"]["merge_loras"] = merge_loras
+        transformer_opts = patcher.model_options["transformer_options"]
+        transformer_opts["block_swap_args"] = block_swap_args
+        transformer_opts["merge_loras"] = merge_loras
+
+        # Enable high-performance defaults unless explicitly disabled
+        env_cuda_graphs = os.environ.get("WAN_ENABLE_CUDA_GRAPHS", "").strip().lower()
+        default_cuda_graphs = env_cuda_graphs not in ("0", "false", "no")
+        transformer_opts.setdefault("enable_cuda_graphs", default_cuda_graphs)
+
+        env_force_graphs = os.environ.get("WAN_FORCE_CUDA_GRAPHS", "").strip().lower()
+        if env_force_graphs in ("1", "true", "yes"):
+            transformer_opts["force_cuda_graphs"] = True
+
+        env_attention_backend = os.environ.get("WAN_ATTENTION_BACKEND", "").strip().lower()
+        if env_attention_backend:
+            transformer_opts["attention_backend"] = env_attention_backend
+        else:
+            transformer_opts.setdefault("attention_backend", "sdpa_flash")
 
         for model in mm.current_loaded_models:
             if model._model() == patcher:

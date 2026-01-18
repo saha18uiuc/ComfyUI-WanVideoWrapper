@@ -49,6 +49,19 @@ def multitalk_loop(self, **kwargs):
     if mode == "auto":
         mode = transformer.multitalk_model_type.lower()
     log.info(f"Multitalk mode: {mode}")
+    
+    # Optional torch.compile for transformer (experimental speedup)
+    # Enable with WAN_TORCH_COMPILE=1 - has warmup cost but speeds up subsequent steps
+    if os.environ.get("WAN_TORCH_COMPILE", "0").strip().lower() in ("1", "true", "yes"):
+        if not getattr(transformer, '_wan_compiled', False):
+            log.info("[MultiTalk] Applying torch.compile to transformer (this may take a moment)...")
+            try:
+                transformer = torch.compile(transformer, mode="reduce-overhead", dynamic=True)
+                transformer._wan_compiled = True
+                log.info("[MultiTalk] torch.compile applied successfully")
+            except Exception as e:
+                log.warning(f"[MultiTalk] torch.compile failed: {e}")
+    
     cond_frame = None
     offload = image_embeds.get("force_offload", False)
     offloaded = False
@@ -59,7 +72,14 @@ def multitalk_loop(self, **kwargs):
     if clip_embeds is not None:
         clip_embeds = clip_embeds.to(dtype)
     colormatch = image_embeds.get("colormatch", "disabled")
-    motion_frame = image_embeds.get("motion_frame", 25)
+    # Allow environment variable override for motion_frame (overlap)
+    # Lower value = fewer windows = faster generation
+    motion_frame_env = os.environ.get("MOTION_FRAME", None)
+    if motion_frame_env is not None:
+        motion_frame = int(motion_frame_env)
+        log.info(f"[MultiTalk] Using MOTION_FRAME from env: {motion_frame}")
+    else:
+        motion_frame = image_embeds.get("motion_frame", 25)
     target_w = image_embeds.get("target_w", None)
     target_h = image_embeds.get("target_h", None)
     original_images = cond_image = image_embeds.get("multitalk_start_image", None)
@@ -480,4 +500,12 @@ def multitalk_loop(self, **kwargs):
         torch.cuda.reset_peak_memory_stats(device)
     except:
         pass
+    
+    # Print LoRA timing stats if enabled
+    try:
+        from ..custom_linear import print_lora_timing_stats
+        print_lora_timing_stats()
+    except:
+        pass
+    
     return {"video": gen_video_samples.permute(1, 2, 3, 0), "output_path": output_path},

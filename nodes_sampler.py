@@ -12,6 +12,8 @@ from .utils import(log, print_memory, apply_lora, fourier_filter, optimized_scal
                    compile_model, dict_to_device, tangential_projection, get_raag_guidance, temporal_score_rescaling, offload_transformer, init_blockswap)
 from .multitalk.multitalk_loop import multitalk_loop
 from .cache_methods.cache_methods import cache_report
+from .cache_methods.lora_merge import merge_static_lora_weights
+from .cache_methods.cuda_graphs import SchedulerGraphRunner, GraphDenoiser
 from .nodes_model_loading import load_weights
 from .enhance_a_video.globals import set_enhance_weight, set_num_frames
 from .WanMove.trajectory import replace_feature
@@ -26,10 +28,174 @@ script_directory = os.path.dirname(os.path.abspath(__file__))
 device = mm.get_torch_device()
 offload_device = mm.unet_offload_device()
 
+# =============================================================================
+# GPU Architecture Detection & Optimization
+# =============================================================================
+# Instead of hardcoding VRAM thresholds, detect GPU architecture properly:
+#   SM 8.0 = Ampere datacenter (A100) - excellent BF16, high bandwidth
+#   SM 8.6 = Ampere consumer (RTX 3090) - good BF16
+#   SM 8.9 = Ada Lovelace (L4, RTX 4090) - optimized for FP8/FP16, not BF16
+#   SM 9.0 = Hopper (H100) - excellent everything
+# =============================================================================
+
+class GPUConfig:
+    """Detected GPU configuration for architecture-aware optimizations. Lazy detection."""
+    _detected = False
+    arch = "unknown"  # "ampere_dc", "ampere", "ada", "hopper", "unknown"
+    sm_version = (0, 0)
+    name = ""
+    vram_gb = 0
+    # Optimization flags based on architecture
+    use_bf16_reduced = False  # BF16 reduced precision matmul
+    use_scheduler_graphs = True  # CUDA graphs for scheduler step in audio mode
+    cudnn_benchmark = True
+    
+    @classmethod
+    def detect(cls):
+        """Lazy detection - only runs once when first needed."""
+        if cls._detected:
+            return
+        cls._detected = True
+        
+        if not torch.cuda.is_available():
+            return
+        
+        try:
+            props = torch.cuda.get_device_properties(0)
+            cls.sm_version = (props.major, props.minor)
+            cls.name = props.name
+            cls.vram_gb = props.total_memory / (1024**3)
+            
+            major, minor = cls.sm_version
+            
+            if major == 8 and minor == 0:
+                # A100 (Ampere datacenter)
+                cls.arch = "ampere_dc"
+                cls.use_bf16_reduced = True
+                cls.use_scheduler_graphs = True
+            elif major == 8 and minor == 9:
+                # L4, RTX 4090 (Ada Lovelace)
+                cls.arch = "ada"
+                cls.use_bf16_reduced = False
+                cls.use_scheduler_graphs = False
+            elif major == 9:
+                # H100 (Hopper)
+                cls.arch = "hopper"
+                cls.use_bf16_reduced = True
+                cls.use_scheduler_graphs = True
+            elif major == 8:
+                # Other Ampere (RTX 3090, A10, etc.)
+                cls.arch = "ampere"
+                cls.use_bf16_reduced = True
+                cls.use_scheduler_graphs = cls.vram_gb >= 24
+            else:
+                cls.arch = "unknown"
+                cls.use_bf16_reduced = False
+                cls.use_scheduler_graphs = False
+            
+            # Apply architecture-specific optimizations
+            if cls.use_bf16_reduced and hasattr(torch.backends.cuda.matmul, 'allow_bf16_reduced_precision_reduction'):
+                torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
+            
+            log.info(f"[GPU] {cls.name} (SM {major}.{minor}, {cls.vram_gb:.0f}GB) → {cls.arch}")
+        except Exception:
+            pass
+
+GPU_CONFIG = GPUConfig
+
+try:
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = GPU_CONFIG.cudnn_benchmark
+    torch.backends.cudnn.deterministic = False
+    if hasattr(torch, "set_float32_matmul_precision"):
+        torch.set_float32_matmul_precision("high")
+    
+    # Flash SDP works well on all modern GPUs
+    if hasattr(torch.backends.cuda, 'enable_flash_sdp'):
+        torch.backends.cuda.enable_flash_sdp(True)
+    if hasattr(torch.backends.cuda, 'enable_mem_efficient_sdp'):
+        torch.backends.cuda.enable_mem_efficient_sdp(True)
+    
+    # Architecture-specific matmul optimizations are applied lazily when GPU is first used
+    # This avoids triggering CUDA initialization at import time
+    
+    # CUDA memory optimization
+    alloc_conf = "expandable_segments:True,garbage_collection_threshold:0.8"
+    if "PYTORCH_ALLOC_CONF" not in os.environ:
+        os.environ["PYTORCH_ALLOC_CONF"] = alloc_conf
+    if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = alloc_conf
+except Exception:
+    pass
+
 rope_functions = ["default", "comfy", "comfy_chunked"]
 
 VAE_STRIDE = (4, 8, 8)
 PATCH_SIZE = (1, 2, 2)
+
+WAN_KEEP_XFORMERS = os.environ.get("WAN_KEEP_XFORMERS", "").strip().lower() in ("1", "true", "yes")
+WAN_FORCE_SDPA = os.environ.get("WAN_FORCE_SDPA", "").strip().lower() in ("1", "true", "yes")
+WAN_FORCE_BATCHED_CFG = os.environ.get("WAN_FORCE_BATCHED_CFG", "").strip().lower() in ("1", "true", "yes")
+_XFORMERS_DISABLED_GLOBALLY = False
+
+
+def _get_xformers_state():
+    getter = getattr(mm, "xformers_enabled", None)
+    if callable(getter):
+        try:
+            return getter()
+        except Exception:
+            pass
+    if hasattr(mm, "use_xformers"):
+        try:
+            return bool(mm.use_xformers)
+        except Exception:
+            pass
+    if hasattr(mm, "XFORMERS_ENABLED"):
+        try:
+            return bool(mm.XFORMERS_ENABLED)
+        except Exception:
+            pass
+    return None
+
+
+def _set_xformers_state(enabled: bool):
+    setter = getattr(mm, "set_use_xformers", None)
+    if callable(setter):
+        try:
+            setter(enabled)
+            return True
+        except Exception:
+            pass
+    if hasattr(mm, "use_xformers"):
+        try:
+            mm.use_xformers = enabled
+            return True
+        except Exception:
+            pass
+    if hasattr(mm, "XFORMERS_ENABLED"):
+        try:
+            mm.XFORMERS_ENABLED = enabled
+            return True
+        except Exception:
+            pass
+    return False
+
+
+def _disable_xformers_for_graphs(force=False):
+    global _XFORMERS_DISABLED_GLOBALLY
+    if (WAN_KEEP_XFORMERS and not force) or _XFORMERS_DISABLED_GLOBALLY:
+        return False
+    current_state = _get_xformers_state()
+    if current_state is False:
+        _XFORMERS_DISABLED_GLOBALLY = True
+        return True
+    if _set_xformers_state(False):
+        _XFORMERS_DISABLED_GLOBALLY = True
+        log.info("Disabled xformers attention to keep CUDA graphs capture-compatible.")
+        return True
+    return False
 
 
 class WanVideoSampler:
@@ -86,6 +252,9 @@ class WanVideoSampler:
         patcher = model
         model = model.model
         transformer = model.diffusion_model
+        
+        # Ensure model is in eval mode (disables dropout, uses running stats for batchnorm)
+        transformer.eval()
 
         dtype = model["base_dtype"]
         weight_dtype = model["weight_dtype"]
@@ -97,7 +266,33 @@ class WanVideoSampler:
         tiled_vae = image_embeds.get("tiled_vae", False)
 
         transformer_options = copy.deepcopy(patcher.model_options.get("transformer_options", None))
+        if transformer_options is None:
+            transformer_options = {}
+        force_sdpa_attention = transformer_options.get("force_sdpa_attention", False) or WAN_FORCE_SDPA
+        transformer_options["force_sdpa_attention"] = force_sdpa_attention
+        if force_sdpa_attention:
+            _disable_xformers_for_graphs(force=True)
+        force_batched_cfg = transformer_options.get("force_batched_cfg", False) or WAN_FORCE_BATCHED_CFG
+        if force_batched_cfg and (multitalk_embeds is not None or fantasytalking_embeds is not None):
+            log.warning("Batched CFG disabled because audio-guided modes require separate passes.")
+            force_batched_cfg = False
+        transformer_options["force_batched_cfg"] = force_batched_cfg
+        if force_batched_cfg and slg_args is not None:
+            log.warning("Force batched CFG requested but SLG arguments present; falling back to sequential CFG.")
+            force_batched_cfg = False
+        if force_batched_cfg:
+            batched_cfg = True
+            log.info("Batched CFG enabled (forced) to halve transformer passes per step.")
         merge_loras = transformer_options["merge_loras"]
+        use_cuda_graphs = transformer_options.get("enable_cuda_graphs", False)
+        env_force_cuda_graphs = os.environ.get("WAN_FORCE_CUDA_GRAPHS", "").strip().lower() in ("1", "true", "yes")
+        env_disable_cuda_graphs = os.environ.get("WAN_ENABLE_CUDA_GRAPHS", "").strip().lower() in ("0", "false", "no")
+        if env_disable_cuda_graphs:
+            use_cuda_graphs = False
+        force_cuda_graphs = transformer_options.get("force_cuda_graphs", False) or env_force_cuda_graphs
+        attention_backend_override = transformer_options.get("attention_backend", None)
+        transformer_options["enable_cuda_graphs"] = use_cuda_graphs
+        transformer_options["force_cuda_graphs"] = force_cuda_graphs
 
         block_swap_args = transformer_options.get("block_swap_args", None)
         if block_swap_args is not None:
@@ -108,6 +303,38 @@ class WanVideoSampler:
             transformer.block_swap_debug = block_swap_args.get("block_swap_debug", False)
             transformer.offload_img_emb = block_swap_args.get("offload_img_emb", False)
             transformer.offload_txt_emb = block_swap_args.get("offload_txt_emb", False)
+
+        cuda_graph_options = transformer_options.get("cuda_graph_options", {})
+        graph_warmup_iters = int(cuda_graph_options.get("warmup_iters", 2))
+        graph_memory_factor = float(cuda_graph_options.get("memory_factor", 3.0))
+        graph_min_free_ratio = float(cuda_graph_options.get("min_free_ratio", 0.3))
+        graph_max_capture_ratio = float(cuda_graph_options.get("max_capture_ratio", 0.25))
+        env_ratio = os.environ.get("WAN_GRAPH_MAX_CAPTURE_RATIO", None)
+        if env_ratio:
+            try:
+                graph_max_capture_ratio = float(env_ratio)
+            except ValueError:
+                pass
+        env_min_ratio = os.environ.get("WAN_GRAPH_MIN_FREE_RATIO", None)
+        if env_min_ratio:
+            try:
+                graph_min_free_ratio = float(env_min_ratio)
+            except ValueError:
+                pass
+        env_memory_factor = os.environ.get("WAN_GRAPH_MEMORY_FACTOR", None)
+        if env_memory_factor:
+            try:
+                graph_memory_factor = float(env_memory_factor)
+            except ValueError:
+                pass
+        graph_max_capture_bytes = None
+        if device.type == "cuda" and torch.cuda.is_available():
+            device_index = device.index if device.index is not None else torch.cuda.current_device()
+            try:
+                total_mem = torch.cuda.get_device_properties(device_index).total_memory
+                graph_max_capture_bytes = int(total_mem * graph_max_capture_ratio)
+            except Exception:
+                graph_max_capture_bytes = None
 
         is_5b = transformer.out_dim == 48
         vae_upscale_factor = 16 if is_5b else 8
@@ -125,6 +352,7 @@ class WanVideoSampler:
             load_weights(patcher.model.diffusion_model, patcher.model["sd"], weight_dtype, base_dtype=dtype, transformer_load_device=device,
                          block_swap_args=block_swap_args, compile_args=model["compile_args"])
 
+        total_lora_patches = len(patcher.patches)
         if gguf_reader is not None: #handle GGUF
             load_weights(transformer, patcher.model["sd"], base_dtype=dtype, transformer_load_device=device, patcher=patcher, gguf=True,
                          reader=gguf_reader, block_swap_args=block_swap_args, compile_args=model["compile_args"])
@@ -135,14 +363,31 @@ class WanVideoSampler:
             if not merge_loras and fp8_matmul:
                 raise NotImplementedError("FP8 matmul with unmerged LoRAs is not supported")
             set_lora_params(transformer, patcher.patches)
+            static_threshold = transformer_options.get("static_lora_merge_threshold", 8)
+            auto_merge_enabled = transformer_options.get("auto_static_lora_merge", True)
+            if auto_merge_enabled and static_threshold > 2 and total_lora_patches >= 256:
+                if total_lora_patches >= 1024:
+                    adaptive_threshold = 2
+                elif total_lora_patches >= 512:
+                    adaptive_threshold = 3
+                else:
+                    adaptive_threshold = 4
+                if adaptive_threshold < static_threshold:
+                    log.info(f"Auto-adjusting static LoRA merge threshold from {static_threshold} to {adaptive_threshold} based on {total_lora_patches} patches.")
+                    static_threshold = adaptive_threshold
+            merge_static_lora_weights(transformer, min_patches=static_threshold)
         else:
             remove_lora_from_module(transformer) #clear possible unmerged lora weights
 
         transformer.lora_scheduling_enabled = transformer_options.get("lora_scheduling_enabled", False)
 
-        #torch.compile
-        if model["auto_cpu_offload"] is False:
-            transformer = compile_model(transformer, model["compile_args"])
+        # torch.compile (block-level when enabled)
+        try:
+            compile_args = model["compile_args"]
+        except KeyError:
+            compile_args = None
+        if compile_args:
+            transformer = compile_model(transformer, compile_args)
 
         multitalk_sampling = image_embeds.get("multitalk_sampling", False)
 
@@ -171,6 +416,7 @@ class WanVideoSampler:
             add_noise_to_samples = True #for now to not break old workflows
 
         sample_scheduler = None
+        sample_scheduler_flipped = None
         if isinstance(scheduler, dict):
             sample_scheduler = copy.deepcopy(scheduler["sample_scheduler"])
             timesteps = scheduler["timesteps"]
@@ -182,6 +428,15 @@ class WanVideoSampler:
 
         total_steps = steps
         steps = len(timesteps)
+
+        if force_sdpa_attention and transformer_options.get("attention_mode_override", None) is None:
+            transformer_options["attention_mode_override"] = {
+                "mode": "sdpa",
+                "blocks": None,
+                "start_step": 0,
+                "end_step": steps,
+                "verbose": False,
+            }
 
         is_pusa = "pusa" in sample_scheduler.__class__.__name__.lower()
 
@@ -877,6 +1132,41 @@ class WanVideoSampler:
         previous_cache_states = None
         transformer.enable_teacache = transformer.enable_magcache = transformer.enable_easycache = False
         cache_args = teacache_args if teacache_args is not None else cache_args #for backward compatibility on old workflows
+        
+        # Environment variable support for enabling caching without workflow modification
+        env_enable_teacache = os.environ.get("WAN_ENABLE_TEACACHE", "").strip().lower() in ("1", "true", "yes")
+        env_enable_easycache = os.environ.get("WAN_ENABLE_EASYCACHE", "").strip().lower() in ("1", "true", "yes")
+        if cache_args is None and (env_enable_teacache or env_enable_easycache):
+            # Build cache_args from environment variables
+            if env_enable_teacache:
+                teacache_thresh = float(os.environ.get("WAN_TEACACHE_THRESH", "0.3"))
+                teacache_start = int(os.environ.get("WAN_TEACACHE_START_STEP", "1"))
+                teacache_end = int(os.environ.get("WAN_TEACACHE_END_STEP", "-1"))
+                teacache_coefficients = os.environ.get("WAN_TEACACHE_USE_COEFFICIENTS", "1").strip().lower() in ("1", "true", "yes")
+                teacache_mode = os.environ.get("WAN_TEACACHE_MODE", "e")
+                cache_args = {
+                    "cache_type": "TeaCache",
+                    "rel_l1_thresh": teacache_thresh,
+                    "start_step": teacache_start,
+                    "end_step": teacache_end if teacache_end >= 0 else len(timesteps) - 1,
+                    "cache_device": offload_device,
+                    "use_coefficients": teacache_coefficients,
+                    "mode": teacache_mode,
+                }
+                log.info(f"TeaCache enabled via env var: thresh={teacache_thresh}, start={teacache_start}, end={teacache_end}, coefficients={teacache_coefficients}")
+            elif env_enable_easycache:
+                easycache_thresh = float(os.environ.get("WAN_EASYCACHE_THRESH", "0.015"))
+                easycache_start = int(os.environ.get("WAN_EASYCACHE_START_STEP", "1"))
+                easycache_end = int(os.environ.get("WAN_EASYCACHE_END_STEP", "-1"))
+                cache_args = {
+                    "cache_type": "EasyCache",
+                    "easycache_thresh": easycache_thresh,
+                    "start_step": easycache_start,
+                    "end_step": easycache_end if easycache_end >= 0 else len(timesteps) - 1,
+                    "cache_device": offload_device,
+                }
+                log.info(f"EasyCache enabled via env var: thresh={easycache_thresh}, start={easycache_start}, end={easycache_end}")
+        
         if cache_args is not None:
             from .cache_methods.cache_methods import set_transformer_cache_method
             transformer = set_transformer_cache_method(transformer, timesteps, cache_args)
@@ -939,6 +1229,17 @@ class WanVideoSampler:
             use_tsr = experimental_args.get("temporal_score_rescaling", False)
             tsr_k = experimental_args.get("tsr_k", 1.0)
             tsr_sigma = experimental_args.get("tsr_sigma", 1.0)
+            if "enable_cuda_graphs" in experimental_args:
+                use_cuda_graphs = bool(experimental_args["enable_cuda_graphs"])
+            if "force_cuda_graphs" in experimental_args:
+                force_cuda_graphs = bool(experimental_args["force_cuda_graphs"]) or force_cuda_graphs
+            attn_choice = experimental_args.get("attention_backend", None)
+            if attn_choice is not None:
+                transformer_options["attention_backend"] = attn_choice
+                attention_backend_override = attn_choice
+
+        if attention_backend_override:
+            log.info(f"Attention backend set to {attention_backend_override}")
 
         # Rotary positional embeddings (RoPE)
 
@@ -1160,7 +1461,168 @@ class WanVideoSampler:
                 prev_ones = torch.ones(20, *prev_latents.shape[1:], device=device, dtype=dtype)
                 dual_control_input["prev_latent"] = torch.cat([prev_ones, prev_latents]).unsqueeze(0)
 
+        latent_model_input_ovi = None
+
         #region model pred
+        graph_runners = {"cond": None, "uncond": None}
+        graph_state = {"enabled": False, "blocked_by": []}
+        scheduler_graph_runner = None
+        scheduler_graph_enabled = False
+        scheduler_graph_flipped = None
+        graph_runner_config = {
+            "warmup_iters": graph_warmup_iters,
+            "memory_factor": graph_memory_factor,
+            "min_free_ratio": graph_min_free_ratio,
+            "max_capture_bytes": graph_max_capture_bytes,
+            "device": device if device.type == "cuda" else None,
+        }
+        graph_blockers = [
+            ("cache_args", cache_args is not None),
+            ("teacache", getattr(transformer, "enable_teacache", False)),
+            ("magcache", getattr(transformer, "enable_magcache", False)),
+            ("easycache", getattr(transformer, "enable_easycache", False)),
+            ("lora_scheduling", getattr(transformer, "lora_scheduling_enabled", False)),
+            ("control_lora", control_lora),
+            ("loop_args", loop_args is not None),
+            ("framepack", framepack),
+            ("wananimate_loop", wananimate_loop),
+            ("video_attention_split_steps", transformer.video_attention_split_steps != []),
+            ("control_latents", control_latents is not None),
+            ("control_camera_latents", control_camera_latents is not None),
+            ("recammaster", recammaster is not None),
+            ("mocha_embeds", mocha_embeds is not None),
+            ("mtv_input", mtv_input is not None),
+            ("phantom_latents", phantom_latents is not None),
+            ("controlnet_latents", controlnet_latents is not None),
+            ("add_cond", add_cond is not None),
+            ("minimax_latents", minimax_latents is not None),
+            ("fantasy_portrait_input", fantasy_portrait_input is not None),
+            ("unianim_data", unianim_data is not None),
+            ("sdancer_data", sdancer_data is not None),
+            ("s2v_audio_input", s2v_audio_input is not None),
+            ("s2v_pose", s2v_pose is not None),
+            ("humo_audio", humo_audio is not None),
+            ("wananim_face_pixels", wananim_face_pixels is not None),
+            ("wananim_pose_latents", wananim_pose_latents is not None),
+            ("uni3c_data", uni3c_data is not None),
+            ("latent_model_input_ovi", latent_model_input_ovi is not None),
+            ("flashvsr_LQ_latent", flashvsr_LQ_latent is not None),
+            ("scail_data", scail_data is not None),
+            ("one_to_all_data", one_to_all_data is not None),
+            ("wanmove_embeds", wanmove_embeds is not None),
+        ]
+        blocked_reasons = [name for name, cond in graph_blockers if cond]
+        graph_safe = len(blocked_reasons) == 0
+        if (use_cuda_graphs or force_cuda_graphs) and device.type == "cuda":
+            if not graph_safe and not force_cuda_graphs and blocked_reasons:
+                log.info(f"CUDA graphs disabled due to: {', '.join(blocked_reasons)}")
+            if not graph_safe and force_cuda_graphs and blocked_reasons:
+                log.warning(f"Forcing CUDA graph capture despite: {', '.join(blocked_reasons)}")
+            graph_state["enabled"] = graph_safe or force_cuda_graphs
+            graph_state["blocked_by"] = blocked_reasons
+        else:
+            graph_state["blocked_by"] = blocked_reasons
+            graph_state["enabled"] = False
+
+        scheduler_blockers = [
+            ("latents_to_not_step", latents_to_not_step != 0),
+            ("clean_latent_indices", bool(clean_latent_indices)),
+            ("bidirectional_sampling", bidirectional_sampling),
+            ("is_pusa", is_pusa),
+            ("longcat", getattr(transformer, "is_longcat", False)),
+        ]
+        scheduler_safe = not any(flag for _, flag in scheduler_blockers)
+        scheduler_graph_enabled = (
+            (use_cuda_graphs or force_cuda_graphs)
+            and device.type == "cuda"
+            and (scheduler_safe or force_cuda_graphs)
+        )
+        if graph_state["enabled"]:
+            log.info("CUDA graphs active for WanVideo transformer.")
+            if transformer_options.get("disable_xformers_for_graphs", True):
+                _disable_xformers_for_graphs()
+        if scheduler_graph_enabled:
+            log.info("CUDA graphs active for scheduler step.")
+
+        def disable_transformer_graphs(reason):
+            """Disable transformer graphs. Keep scheduler graphs based on GPU architecture."""
+            nonlocal graph_state, graph_runners, scheduler_graph_enabled, scheduler_graph_runner, scheduler_graph_flipped
+            if graph_state["enabled"]:
+                log.warning(f"Disabling transformer CUDA graphs: {reason}")
+            graph_state["enabled"] = False
+            for key in ("cond", "uncond"):
+                runner = graph_runners.get(key)
+                if runner is not None and hasattr(runner, "release"):
+                    runner.release()
+                graph_runners[key] = None
+            
+            # Lazy GPU detection - only when needed
+            GPU_CONFIG.detect()
+            
+            # Use GPU_CONFIG to decide on scheduler graphs (architecture-aware)
+            if not GPU_CONFIG.use_scheduler_graphs and scheduler_graph_enabled:
+                log.info(f"Also disabling scheduler graphs ({GPU_CONFIG.arch} arch)")
+                scheduler_graph_enabled = False
+                if scheduler_graph_runner is not None and hasattr(scheduler_graph_runner, "release"):
+                    scheduler_graph_runner.release()
+                if scheduler_graph_flipped is not None and hasattr(scheduler_graph_flipped, "release"):
+                    scheduler_graph_flipped.release()
+                scheduler_graph_runner = None
+                scheduler_graph_flipped = None
+        
+        def disable_graphs(reason):
+            """Disable ALL graphs (transformer + scheduler)."""
+            nonlocal graph_state, graph_runners, scheduler_graph_runner, scheduler_graph_flipped, scheduler_graph_enabled
+            if graph_state["enabled"] or scheduler_graph_enabled:
+                log.warning(f"Disabling CUDA graphs: {reason}")
+            graph_state["enabled"] = False
+            scheduler_graph_enabled = False
+            for key in ("cond", "uncond"):
+                runner = graph_runners.get(key)
+                if runner is not None and hasattr(runner, "release"):
+                    runner.release()
+                graph_runners[key] = None
+            if scheduler_graph_runner is not None and hasattr(scheduler_graph_runner, "release"):
+                scheduler_graph_runner.release()
+            if scheduler_graph_flipped is not None and hasattr(scheduler_graph_flipped, "release"):
+                scheduler_graph_flipped.release()
+            scheduler_graph_runner = None
+            scheduler_graph_flipped = None
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+
+        def scheduler_step_runner(noise, timestep_tensor, latent_tensor, flipped=False):
+            nonlocal scheduler_graph_runner, scheduler_graph_flipped
+            runner = sample_scheduler_flipped if flipped else sample_scheduler
+            if (
+                scheduler_graph_enabled
+                and noise.is_cuda
+                and latent_tensor.is_cuda
+                and timestep_tensor.is_cuda
+                and not flipped
+            ):
+                if scheduler_graph_runner is None:
+                    scheduler_graph_runner = SchedulerGraphRunner(runner, scheduler_step_args, warmup_iters=graph_runner_config["warmup_iters"])
+                try:
+                    return scheduler_graph_runner(noise, timestep_tensor, latent_tensor)
+                except torch.cuda.OutOfMemoryError:
+                    disable_graphs("scheduler graph OOM")
+                    return runner.step(noise, timestep_tensor, latent_tensor, **scheduler_step_args)[0]
+            if (
+                scheduler_graph_enabled
+                and flipped
+            ):
+                if scheduler_graph_flipped is None:
+                    scheduler_graph_flipped = SchedulerGraphRunner(runner, scheduler_step_args, warmup_iters=graph_runner_config["warmup_iters"])
+                try:
+                    return scheduler_graph_flipped(noise, timestep_tensor, latent_tensor)
+                except torch.cuda.OutOfMemoryError:
+                    disable_graphs("scheduler graph OOM (flipped)")
+                    return runner.step(noise, timestep_tensor, latent_tensor, **scheduler_step_args)[0]
+            return runner.step(noise, timestep_tensor, latent_tensor, **scheduler_step_args)[0]
+
         def predict_with_cfg(z, cfg_scale, positive_embeds, negative_embeds, timestep, idx, image_cond=None, clip_fea=None,
                              control_latents=None, vace_data=None, unianim_data=None, audio_proj=None, control_camera_latents=None,
                              add_cond=None, cache_state=None, context_window=None, multitalk_audio_embeds=None, fantasy_portrait_input=None, reverse_time=False,
@@ -1169,6 +1631,35 @@ class WanVideoSampler:
                              wananim_face_pixels=None, uni3c_data=None, latent_model_input_ovi=None, flashvsr_LQ_latent=None,):
             nonlocal transformer
             nonlocal audio_cfg_scale
+            nonlocal graph_state
+            nonlocal graph_runners
+
+            def run_transformer_with_graph(explicit_key=None, **kwargs):
+                run_key = explicit_key or ("uncond" if kwargs.get("is_uncond", False) else "cond")
+                if graph_state["enabled"]:
+                    runner = graph_runners[run_key]
+                    if runner is None:
+                        graph_runners[run_key] = GraphDenoiser(
+                            transformer,
+                            warmup_iters=graph_runner_config["warmup_iters"],
+                            memory_factor=graph_runner_config["memory_factor"],
+                            min_free_ratio=graph_runner_config["min_free_ratio"],
+                            max_capture_bytes=graph_runner_config["max_capture_bytes"],
+                            device=graph_runner_config["device"],
+                        )
+                        runner = graph_runners[run_key]
+                    try:
+                        return runner(**kwargs)
+                    except RuntimeError as e:
+                        if "graph_insufficient_memory" in str(e):
+                            log.warning("Skipping CUDA graph capture due to low free VRAM.")
+                        else:
+                            log.warning(f"Disabling CUDA graph ({run_key}) due to: {e}")
+                        disable_graphs(str(e))
+                    except torch.cuda.OutOfMemoryError:
+                        log.warning("CUDA graph replay OOM, disabling graphs for this run.")
+                        disable_graphs("graph replay OOM")
+                return transformer(**kwargs)
 
             autocast_enabled = ("fp8" in model["quantization"] and not transformer.patched_linear)
             with torch.autocast(device_type=mm.get_autocast_device(device), dtype=dtype) if autocast_enabled else nullcontext():
@@ -1425,6 +1916,14 @@ class WanVideoSampler:
                     else:
                         dual_control_in = dual_control_input
 
+                if graph_state["enabled"]:
+                    dynamic_pipeline = context_window is not None
+                    dynamic_pipeline = dynamic_pipeline or multitalk_audio_input is not None or humo_audio_input is not None
+                    dynamic_pipeline = dynamic_pipeline or dual_control_in is not None or scail_data_in is not None
+                    if dynamic_pipeline:
+                        # Only disable transformer graphs - scheduler graphs have static shapes and can stay enabled!
+                        disable_transformer_graphs("variable-length context/audio inputs")
+
                 base_params = {
                     'x': [z], # latent
                     'y': [image_cond_input] if image_cond_input is not None else None, # image cond
@@ -1505,12 +2004,13 @@ class WanVideoSampler:
                         if pos_latent is not None: # for humo
                             base_params['x'] = [torch.cat([z[:, :-humo_reference_count], pos_latent], dim=1)]
                         base_params["add_text_emb"] = qwenvl_embeds_pos.to(device) if qwenvl_embeds_pos is not None else None # QwenVL embeddings for Bindweave
-                        noise_pred_cond, noise_pred_ovi, cache_state_cond = transformer(
+                        cond_outputs = run_transformer_with_graph(
                             context=positive_embeds,
                             pred_id=cache_state[0] if cache_state else None,
                             vace_data=vace_data, attn_cond=attn_cond,
                             **base_params
                         )
+                        noise_pred_cond, noise_pred_ovi, cache_state_cond = cond_outputs
                         noise_pred_cond = noise_pred_cond[0]
                         noise_pred_ovi = noise_pred_ovi[0] if noise_pred_ovi is not None else None
                         if math.isclose(cfg_scale, 1.0):
@@ -1518,14 +2018,19 @@ class WanVideoSampler:
                                 noise_pred_cond = fourier_filter(noise_pred_cond, fresca_scale_low, fresca_scale_high, fresca_freq_cutoff)
                             if fantasy_portrait_input is not None and not math.isclose(portrait_cfg[idx], 1.0):
                                 base_params["fantasy_portrait_input"] = None
-                                noise_pred_no_portrait, noise_pred_ovi, cache_state_uncond = transformer(context=positive_embeds, pred_id=cache_state[0] if cache_state else None,
-                                vace_data=vace_data, attn_cond=attn_cond, **base_params)
+                                outputs = run_transformer_with_graph(
+                                    context=positive_embeds, pred_id=cache_state[0] if cache_state else None,
+                                    vace_data=vace_data, attn_cond=attn_cond, **base_params
+                                )
+                                noise_pred_no_portrait, noise_pred_ovi, cache_state_uncond = outputs
                                 return noise_pred_no_portrait[0] + portrait_cfg[idx] * (noise_pred_cond - noise_pred_no_portrait[0]), noise_pred_ovi, [cache_state_cond, cache_state_uncond]
                             elif multitalk_audio_input is not None and not math.isclose(audio_cfg_scale[idx], 1.0):
                                 base_params['multitalk_audio'] = torch.zeros_like(multitalk_audio_input)[-1:]
-                                noise_pred_uncond_audio, _, cache_state_uncond = transformer(
-                                context=positive_embeds, pred_id=cache_state[0] if cache_state else None,
-                                vace_data=vace_data, attn_cond=attn_cond, **base_params)
+                                outputs = run_transformer_with_graph(
+                                    context=positive_embeds, pred_id=cache_state[0] if cache_state else None,
+                                    vace_data=vace_data, attn_cond=attn_cond, **base_params
+                                )
+                                noise_pred_uncond_audio, _, cache_state_uncond = outputs
                                 return noise_pred_uncond_audio[0] + audio_cfg_scale[idx] * (noise_pred_cond - noise_pred_uncond_audio[0]), noise_pred_ovi, [cache_state_cond, cache_state_uncond]
                             else:
                                 return noise_pred_cond, noise_pred_ovi, [cache_state_cond]
@@ -1542,11 +2047,12 @@ class WanVideoSampler:
                         if neg_latent is not None:
                             base_params['x'] = [torch.cat([z[:, :-humo_reference_count], neg_latent], dim=1)]
 
-                        noise_pred_uncond_text, noise_pred_ovi_uncond, cache_state_uncond = transformer(
+                        uncond_outputs = run_transformer_with_graph(
                             context=negative_embeds if humo_audio_input_neg is None else positive_embeds, #ti #t
                             pred_id=cache_state[1] if cache_state else None,
                             vace_data=vace_data, attn_cond=attn_cond_neg,
                             **base_params)
+                        noise_pred_uncond_text, noise_pred_ovi_uncond, cache_state_uncond = uncond_outputs
                         noise_pred_uncond_text = noise_pred_uncond_text[0]
                         noise_pred_ovi_uncond = noise_pred_ovi_uncond[0] if noise_pred_ovi_uncond is not None else None
 
@@ -1558,9 +2064,11 @@ class WanVideoSampler:
                                 if t > 980 and humo_image_cond_neg_input is not None: # use image cond for first timesteps
                                     base_params['y'] = [humo_image_cond_neg_input]
 
-                                noise_pred_humo_audio_uncond, _, cache_state_humo = transformer(
-                                context=negative_embeds, pred_id=cache_state[2] if cache_state else None, vace_data=None,
-                                **base_params)
+                                humo_outputs = run_transformer_with_graph(
+                                    context=negative_embeds, pred_id=cache_state[2] if cache_state else None, vace_data=None,
+                                    **base_params
+                                )
+                                noise_pred_humo_audio_uncond, _, cache_state_humo = humo_outputs
 
                                 noise_pred = (noise_pred_uncond_text + humo_audio_cfg_scale[idx] * (noise_pred_cond - noise_pred_humo_audio_uncond[0])
                                             + (cfg_scale - 2.0) * (noise_pred_humo_audio_uncond[0] - noise_pred_uncond_text))
@@ -1569,15 +2077,19 @@ class WanVideoSampler:
                                 if cache_state is not None and len(cache_state) != 4:
                                     cache_state.append(None)
                                 # audio
-                                noise_pred_humo_null, _, cache_state_humo = transformer(
-                                context=negative_embeds, pred_id=cache_state[2] if cache_state else None, vace_data=None,
-                                **base_params)
+                                humo_null_outputs = run_transformer_with_graph(
+                                    context=negative_embeds, pred_id=cache_state[2] if cache_state else None, vace_data=None,
+                                    **base_params
+                                )
+                                noise_pred_humo_null, _, cache_state_humo = humo_null_outputs
                                 # negative
                                 if humo_audio_input is not None:
                                     base_params['humo_audio'] = humo_audio_input
-                                noise_pred_humo_audio, _, cache_state_humo2 = transformer(
-                                context=positive_embeds, pred_id=cache_state[3] if cache_state else None, vace_data=None,
-                                **base_params)
+                                humo_audio_outputs = run_transformer_with_graph(
+                                    context=positive_embeds, pred_id=cache_state[3] if cache_state else None, vace_data=None,
+                                    **base_params
+                                )
+                                noise_pred_humo_audio, _, cache_state_humo2 = humo_audio_outputs
                                 noise_pred = (humo_audio_cfg_scale[idx] * (noise_pred_cond - noise_pred_humo_audio[0])
                                     + cfg_scale * (noise_pred_humo_audio[0] - noise_pred_uncond_text)
                                     + cfg_scale * (noise_pred_uncond_text - noise_pred_humo_null[0])
@@ -1588,9 +2100,11 @@ class WanVideoSampler:
                         if use_phantom and not math.isclose(phantom_cfg_scale[idx], 1.0):
                             if cache_state is not None and len(cache_state) != 3:
                                 cache_state.append(None)
-                            noise_pred_phantom, _, cache_state_phantom = transformer(
-                            context=negative_embeds, pred_id=cache_state[2] if cache_state else None, vace_data=None,
-                            **base_params)
+                            phantom_outputs = run_transformer_with_graph(
+                                context=negative_embeds, pred_id=cache_state[2] if cache_state else None, vace_data=None,
+                                **base_params
+                            )
+                            noise_pred_phantom, _, cache_state_phantom = phantom_outputs
 
                             noise_pred = (noise_pred_uncond_text + phantom_cfg_scale[idx] * (noise_pred_phantom[0] - noise_pred_uncond_text)
                                           + cfg_scale * (noise_pred_cond - noise_pred_phantom[0]))
@@ -1604,11 +2118,13 @@ class WanVideoSampler:
                                 base_params['audio_proj'] = None
                                 base_params['multitalk_audio'] = torch.zeros_like(multitalk_audio_input)[-1:] if multitalk_audio_input is not None else None
                                 base_params['is_uncond'] = False
-                                noise_pred_uncond_audio, _, cache_state_audio = transformer(
+                                audio_outputs = run_transformer_with_graph(
                                     context=negative_embeds,
                                     pred_id=cache_state[2] if cache_state else None,
                                     vace_data=vace_data,
-                                    **base_params)
+                                    **base_params
+                                )
+                                noise_pred_uncond_audio, _, cache_state_audio = audio_outputs
                                 noise_pred_uncond_audio = noise_pred_uncond_audio[0]
 
                                 noise_pred = noise_pred_uncond_audio + cfg_scale * (
@@ -1620,9 +2136,11 @@ class WanVideoSampler:
                             base_params['is_uncond'] = False
                             if cache_state is not None and len(cache_state) != 3:
                                 cache_state.append(None)
-                            noise_pred_lynx, _, cache_state_lynx = transformer(
-                            context=negative_embeds, pred_id=cache_state[2] if cache_state else None, vace_data=None,
-                            **base_params)
+                            lynx_outputs = run_transformer_with_graph(
+                                context=negative_embeds, pred_id=cache_state[2] if cache_state else None, vace_data=None,
+                                **base_params
+                            )
+                            noise_pred_lynx, _, cache_state_lynx = lynx_outputs
 
                             noise_pred = (noise_pred_uncond_text + lynx_cfg_scale[idx] * (noise_pred_lynx[0] - noise_pred_uncond_text)
                                           + cfg_scale * (noise_pred_cond - noise_pred_lynx[0]))
@@ -1634,9 +2152,11 @@ class WanVideoSampler:
                             base_params['one_to_all_controlnet_strength'] = 0.0
                             if cache_state is not None and len(cache_state) != 3:
                                 cache_state.append(None)
-                            noise_pred_pose_uncond, _, cache_state_ref = transformer(
-                            context=negative_embeds, pred_id=cache_state[2] if cache_state else None, vace_data=None,
-                            **base_params)
+                            pose_outputs = run_transformer_with_graph(
+                                context=negative_embeds, pred_id=cache_state[2] if cache_state else None, vace_data=None,
+                                **base_params
+                            )
+                            noise_pred_pose_uncond, _, cache_state_ref = pose_outputs
 
                             noise_pred = (noise_pred_uncond_text + one_to_all_pose_cfg_scale[idx] * (noise_pred_pose_uncond[0] - noise_pred_uncond_text)
                                           + cfg_scale * (noise_pred_cond - noise_pred_pose_uncond[0]))
@@ -1644,15 +2164,18 @@ class WanVideoSampler:
 
                     #batched
                     else:
-                        base_params['z'] = [z] * 2
+                        base_params.pop('is_uncond', None)
+                        base_params['x'] = [z] * 2
                         base_params['y'] = [image_cond_input] * 2 if image_cond_input is not None else None
                         base_params['clip_fea'] = torch.cat([clip_fea, clip_fea], dim=0)
                         cache_state_uncond = None
-                        [noise_pred_cond, noise_pred_uncond_text], _, cache_state_cond = transformer(
-                            context=positive_embeds + negative_embeds, is_uncond=False,
+                        batched_outputs = run_transformer_with_graph(
+                            context=positive_embeds + negative_embeds,
+                            is_uncond=False,
                             pred_id=cache_state[0] if cache_state else None,
                             **base_params
                         )
+                        [noise_pred_cond, noise_pred_uncond_text], _, cache_state_cond = batched_outputs
                 except Exception as e:
                     log.error(f"Error during model prediction: {e}")
                     if force_offload:
@@ -2138,9 +2661,10 @@ class WanVideoSampler:
                                     cache_state=self.cache_state, fantasy_portrait_input=fantasy_portrait_input, mtv_motion_tokens=mtv_motion_tokens,
                                     s2v_audio_input=s2v_audio_input_slice, s2v_ref_motion=input_motion_latents, s2v_motion_frames=s2v_motion_frames, s2v_pose=s2v_pose_slice)
 
-                                latent = sample_scheduler.step(
-                                        noise_pred.unsqueeze(0), timestep, latent.unsqueeze(0),
-                                        **scheduler_step_args)[0].squeeze(0)
+                                sched_latent = scheduler_step_runner(
+                                        noise_pred.unsqueeze(0), timestep, latent.unsqueeze(0)
+                                )
+                                latent = sched_latent.squeeze(0)
                                 if callback is not None:
                                     callback_latent = (latent_model_input.to(device) - noise_pred.to(device) * t.to(device) / 1000).detach().permute(1,0,2,3)
                                     callback(step_iteration_count, callback_latent, None, s2v_num_repeat*(len(timesteps)))
@@ -2401,7 +2925,12 @@ class WanVideoSampler:
                                 if use_tsr:
                                     noise_pred = temporal_score_rescaling(noise_pred, latent, timestep, tsr_k, tsr_sigma)
 
-                                latent = sample_scheduler.step(noise_pred.unsqueeze(0), timestep, latent.unsqueeze(0).to(noise_pred.device), **scheduler_step_args)[0].squeeze(0)
+                                sched_latent = scheduler_step_runner(
+                                    noise_pred.unsqueeze(0),
+                                    timestep,
+                                    latent.unsqueeze(0).to(noise_pred.device),
+                                )
+                                latent = sched_latent.squeeze(0)
                                 del noise_pred, latent_model_input, timestep
 
                                 # differential diffusion inpaint
@@ -2510,27 +3039,40 @@ class WanVideoSampler:
                     if transformer.is_longcat:
                         noise_pred = -noise_pred
 
-                    if len(timestep.shape) != 1 and clean_latent_indices and not is_pusa: #5b and longcat, skip clean latents for scheduler step
-                        step_process_indices = [i for i in range(latent.shape[1]) if i not in clean_latent_indices]
-                        latent[:, step_process_indices] = sample_scheduler.step(noise_pred[:, step_process_indices].unsqueeze(0), orig_timestep,
-                                                        latent[:, step_process_indices].unsqueeze(0), **scheduler_step_args)[0].squeeze(0)
-                    else:
-                        if latents_to_not_step > 0:
-                            raw_latent = latent[:, :latents_to_not_step]
-                            noise_pred_in = noise_pred[:, latents_to_not_step:]
-                            latent = latent[:, latents_to_not_step:]
-                        elif recammaster is not None or mocha_embeds is not None:
-                            noise_pred_in = noise_pred[:, :orig_noise_len]
-                            latent = latent[:, :orig_noise_len]
+                        if len(timestep.shape) != 1 and clean_latent_indices and not is_pusa: #5b and longcat, skip clean latents for scheduler step
+                            step_process_indices = [i for i in range(latent.shape[1]) if i not in clean_latent_indices]
+                            sched_out = scheduler_step_runner(
+                                noise_pred[:, step_process_indices].unsqueeze(0),
+                                orig_timestep,
+                                latent[:, step_process_indices].unsqueeze(0),
+                            )
+                            latent[:, step_process_indices] = sched_out.squeeze(0)
                         else:
-                            noise_pred_in = noise_pred
-                        latent = sample_scheduler.step(noise_pred_in.unsqueeze(0), timestep, latent.unsqueeze(0), **scheduler_step_args)[0].squeeze(0)
-                        if noise_pred_flipped is not None:
-                            latent_backwards = sample_scheduler_flipped.step(noise_pred_flipped.unsqueeze(0), timestep, latent_flipped.unsqueeze(0), **scheduler_step_args)[0].squeeze(0)
-                            latent_backwards = torch.flip(latent_backwards, dims=[1])
-                            latent = latent * 0.5 + latent_backwards * 0.5
-                        if latents_to_not_step > 0:
-                            latent = torch.cat([raw_latent, latent], dim=1)
+                            if latents_to_not_step > 0:
+                                raw_latent = latent[:, :latents_to_not_step]
+                                noise_pred_in = noise_pred[:, latents_to_not_step:]
+                                latent = latent[:, latents_to_not_step:]
+                            elif recammaster is not None or mocha_embeds is not None:
+                                noise_pred_in = noise_pred[:, :orig_noise_len]
+                                latent = latent[:, :orig_noise_len]
+                            else:
+                                noise_pred_in = noise_pred
+                            sched_latent = scheduler_step_runner(
+                                noise_pred_in.unsqueeze(0), timestep, latent.unsqueeze(0)
+                            )
+                            latent = sched_latent.squeeze(0)
+                            if noise_pred_flipped is not None:
+                                flipped_latent = scheduler_step_runner(
+                                    noise_pred_flipped.unsqueeze(0),
+                                    timestep,
+                                    latent_flipped.unsqueeze(0),
+                                    flipped=True,
+                                )
+                                latent_backwards = flipped_latent.squeeze(0)
+                                latent_backwards = torch.flip(latent_backwards, dims=[1])
+                                latent = latent * 0.5 + latent_backwards * 0.5
+                            if latents_to_not_step > 0:
+                                latent = torch.cat([raw_latent, latent], dim=1)
 
                     if latent_ovi is not None:
                         latent_ovi = sample_scheduler_ovi.step(noise_pred_ovi.unsqueeze(0), t, latent_ovi.to(device).unsqueeze(0), **scheduler_step_args)[0].squeeze(0)

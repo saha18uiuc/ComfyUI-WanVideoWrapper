@@ -13,6 +13,7 @@ try:
 except:
     pass
 
+
 from .attention import attention
 import numpy as np
 from tqdm import tqdm
@@ -211,7 +212,9 @@ def rope_params(max_seq_len, dim, theta=10000, L_test=25, k=0, freqs_scaling=1.0
     return freqs
 
 @torch.autocast(device_type=mm.get_autocast_device(mm.get_torch_device()), enabled=False)
-@torch.compiler.disable()
+# NOTE: @torch.compiler.disable() REMOVED for CUDA graph compatibility
+# The rope_apply_triton in wanvideo/kernels/rope_triton.py is compile-friendly
+# See PERFORMANCE_OPTIMIZATION_DESIGN.md Phase 3 for details
 def rope_apply(x, grid_sizes, freqs, reverse_time=False):
     x_ndim = grid_sizes.shape[-1]
     if x_ndim == 3:
@@ -285,6 +288,17 @@ def rope_apply_1d(x, grid_sizes, freqs):
         output.append(x_i)
     return torch.stack(output).to(x.dtype)
 
+# Check if PyTorch has fused RMSNorm (2.4+)
+_HAS_FUSED_RMSNORM = hasattr(F, 'rms_norm')
+
+# Try to import custom CUDA RMSNorm kernel
+try:
+    from ..kernels import fused_rmsnorm as cuda_rmsnorm
+    _HAS_CUDA_RMSNORM = True
+except ImportError:
+    _HAS_CUDA_RMSNORM = False
+    cuda_rmsnorm = None
+
 class WanRMSNorm(nn.Module):
 
     def __init__(self, dim, eps=1e-5):
@@ -302,6 +316,11 @@ class WanRMSNorm(nn.Module):
         if use_chunked:
             return self.forward_chunked(x, num_chunks)
         else:
+            # Try custom CUDA kernel first (fastest), then F.rms_norm, then manual
+            if _HAS_CUDA_RMSNORM and x.is_cuda:
+                return cuda_rmsnorm(x, self.weight, self.eps)
+            if _HAS_FUSED_RMSNORM:
+                return F.rms_norm(x, (self.dim,), self.weight, self.eps)
             return self._norm(x.to(self.weight.dtype)) * self.weight
 
     def _norm(self, x):
@@ -316,11 +335,16 @@ class WanRMSNorm(nn.Module):
         start_idx = 0
         for size in chunk_sizes:
             end_idx = start_idx + size
-            
             chunk = x[:, start_idx:end_idx, :]
             
-            norm_factor = torch.rsqrt(chunk.pow(2).mean(dim=-1, keepdim=True) + self.eps)
-            output[:, start_idx:end_idx, :] = chunk * norm_factor.to(chunk.dtype) * self.weight
+            # Try custom CUDA kernel first, then F.rms_norm, then manual
+            if _HAS_CUDA_RMSNORM and chunk.is_cuda:
+                output[:, start_idx:end_idx, :] = cuda_rmsnorm(chunk, self.weight, self.eps)
+            elif _HAS_FUSED_RMSNORM:
+                output[:, start_idx:end_idx, :] = F.rms_norm(chunk, (self.dim,), self.weight, self.eps)
+            else:
+                norm_factor = torch.rsqrt(chunk.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+                output[:, start_idx:end_idx, :] = chunk * norm_factor.to(chunk.dtype) * self.weight
 
             start_idx = end_idx
             
@@ -2613,7 +2637,18 @@ class WanModel(torch.nn.Module):
             x = [torch.cat([u, end_ref_latent.unsqueeze(0)], dim=1) for end_ref_latent, u in zip(end_ref_latent, x)]
 
 
-        x = torch.cat([torch.cat([u, u.new_zeros(1, seq_len - u.size(1), u.size(2))], dim=1) for u in x])
+        batch = len(x)
+        if batch > 0:
+            feature_dim = x[0].size(2)
+            padded = x[0].new_zeros(batch, seq_len, feature_dim)
+            for idx, u in enumerate(x):
+                length = u.size(1)
+                padded[idx, :length].copy_(u.squeeze(0))
+            x = padded
+        else:
+            x = self.original_patch_embedding.weight.new_zeros(
+                (0, seq_len, self.original_patch_embedding.weight.shape[0])
+            )
 
         if self.trainable_cond_mask is not None:
             x = x + cond_mask_weight[0]
@@ -3182,7 +3217,9 @@ class WanModel(torch.nn.Module):
             attention_mode_override_active = False
             attention_mode_override = transformer_options.get("attention_mode_override", None)
             if attention_mode_override is not None:
-                attn_override_blocks = attention_mode_override.get("blocks", range(len(self.blocks)))
+                attn_override_blocks = attention_mode_override.get("blocks", None)
+                if attn_override_blocks is None:
+                    attn_override_blocks = range(len(self.blocks))
                 if attention_mode_override["start_step"] <= current_step < attention_mode_override["end_step"]:
                     attention_mode_override_active = True
                     if attention_mode_override["verbose"]:
@@ -3190,7 +3227,7 @@ class WanModel(torch.nn.Module):
 
             for b, block in enumerate(self.blocks):
                 mm.throw_exception_if_processing_interrupted()
-                if attention_mode_override_active and b in attn_override_blocks:
+                if attention_mode_override_active and (attn_override_blocks is None or b in attn_override_blocks):
                     attention_mode = attention_mode_override['mode']
                 else:
                     attention_mode = None
