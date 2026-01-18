@@ -14,16 +14,18 @@ except Exception:
 
 MERGE_STATIC_LORA = os.environ.get("WAN_MERGE_STATIC_LORA", "1").strip().lower() in ("1", "true", "yes")
 
-# OPTIMIZED: Pre-merge all LoRA patches into a SINGLE delta per layer
-# This is MUCH faster than applying 1262 patches individually
-# Memory: Uses O(weight_size) instead of O(num_patches * rank * features)
-# For 1262 patches, this is usually a net SAVINGS in memory
-LORA_PREMERGE = os.environ.get("WAN_LORA_PREMERGE", "1").strip().lower() in ("1", "true", "yes")
-# Keep merged delta on GPU for speed (don't use CPU storage - causes massive slowdown)
-LORA_PREMERGE_CPU = os.environ.get("WAN_LORA_PREMERGE_CPU", "0").strip().lower() in ("1", "true", "yes")
+# LORA_PREMERGE: OFF by default - causes OOM on memory-constrained GPUs (L4)
+# The memory spike during cache building exceeds available VRAM
+LORA_PREMERGE = os.environ.get("WAN_LORA_PREMERGE", "0").strip().lower() in ("1", "true", "yes")
+
+# LORA_LAZY: Compute LoRA on-demand without ANY caching (lowest memory, still reasonably fast)
+# Uses FP16 accumulation to save memory
+LORA_LAZY = os.environ.get("WAN_LORA_LAZY", "1").strip().lower() in ("1", "true", "yes")
 
 if LORA_PREMERGE:
-    print(f"[WanVideo LoRA] Pre-merge ENABLED - all LoRA patches merged into single delta per layer")
+    print(f"[WanVideo LoRA] Pre-merge ENABLED")
+elif LORA_LAZY:
+    print(f"[WanVideo LoRA] Lazy mode ENABLED - compute on-demand, no caching")
 
 
 @torch.library.custom_op("wanvideo::apply_lora", mutates_args=())
@@ -482,21 +484,27 @@ class CustomLinear(nn.Linear):
     def _get_weight_with_lora(self, weight):
         """Apply LoRA using optimized operations.
         
-        With LORA_PREMERGE (default): Single tensor add - O(1) ops regardless of num patches
-        Without: Loop through all patches - O(N) ops where N = num patches
+        LORA_LAZY (default): Compute on-demand, no caching - lowest memory usage
+        LORA_PREMERGE: Pre-merge all patches (fast but high memory spike)
+        Otherwise: Cache individual patches
         """
         if not getattr(self, "lora_diffs", None):
             return weight
 
+        if LORA_LAZY:
+            # LAZY MODE: Compute on-demand, no caching
+            # Lower memory but reasonably fast - avoids memory spike
+            return self._apply_lora_lazy(weight)
+        
         self._maybe_build_lora_cache(weight)
         if not self._lora_cached_deltas:
             return weight
 
         if LORA_PREMERGE:
-            # FAST PATH: Single tensor add (all patches pre-merged and pre-scaled)
+            # Pre-merged: single tensor add
             return weight + self._lora_cached_deltas[0]
         else:
-            # Slow path: apply each cached patch with its strength
+            # Cached patches: apply each with strength
             weight = weight.clone()
             for idx, cached_entry in enumerate(self._lora_cached_deltas):
                 patch_diff, alpha = cached_entry
@@ -510,6 +518,52 @@ class CustomLinear(nn.Linear):
                 scale = strength_value * alpha
                 weight.add_(patch_diff, alpha=scale)
             return weight
+    
+    def _apply_lora_lazy(self, weight):
+        """Apply LoRA on-demand without caching. Lowest memory usage."""
+        # Work in FP16 for memory efficiency
+        compute_dtype = torch.float16 if weight.is_cuda else weight.dtype
+        
+        # Clone weight for modification
+        result = weight.clone()
+        
+        for idx, lora_diff_names in enumerate(self.lora_diffs):
+            # Get strength
+            lora_strength = self._get_lora_strength(idx)
+            if isinstance(lora_strength, torch.Tensor):
+                strength_value = lora_strength.item() if lora_strength.numel() == 1 else lora_strength.mean().item()
+            else:
+                strength_value = float(lora_strength)
+            
+            if abs(strength_value) < 1e-8:
+                continue
+            
+            if isinstance(lora_diff_names, tuple):
+                # Standard LoRA: A @ B
+                lora_diff_0 = getattr(self, lora_diff_names[0])
+                lora_diff_1 = getattr(self, lora_diff_names[1])
+                lora_diff_2 = getattr(self, lora_diff_names[2])
+                
+                # Compute patch in FP16 to save memory
+                # patch = A @ B  where A is (out, rank), B is (rank, in)
+                patch = torch.mm(
+                    lora_diff_0.flatten(start_dim=1).to(compute_dtype),
+                    lora_diff_1.flatten(start_dim=1).to(compute_dtype)
+                ).reshape(weight.shape)
+                
+                rank = lora_diff_1.shape[0]
+                alpha = (float(lora_diff_2) / rank) if (lora_diff_2 is not None and rank != 0) else 1.0
+                scale = strength_value * alpha
+                
+                # Add to result (converts patch dtype if needed)
+                result.add_(patch.to(result.dtype), alpha=scale)
+                del patch  # Free immediately
+            else:
+                # Pre-computed diff
+                lora_diff = getattr(self, lora_diff_names)
+                result.add_(lora_diff.to(result.dtype), alpha=strength_value)
+        
+        return result
     
 
     def _compute_grouped_lora(self, input, weight):
