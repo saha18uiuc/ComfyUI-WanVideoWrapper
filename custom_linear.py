@@ -13,8 +13,9 @@ except Exception:
         raise RuntimeError("Grouped LoRA kernel unavailable (missing dependencies).")
 
 MERGE_STATIC_LORA = os.environ.get("WAN_MERGE_STATIC_LORA", "1").strip().lower() in ("1", "true", "yes")
-# Fast LoRA: use fused operations when available
-LORA_USE_FUSED = os.environ.get("WAN_LORA_USE_FUSED", "1").strip().lower() in ("1", "true", "yes")
+# CPU LoRA cache: keeps LoRA patches on CPU to save GPU memory (default ON for memory safety)
+# Patches are moved to GPU one at a time with in-place operations
+LORA_CPU_CACHE = os.environ.get("WAN_LORA_CPU_CACHE", "1").strip().lower() in ("1", "true", "yes")
 
 
 @torch.library.custom_op("wanvideo::apply_lora", mutates_args=())
@@ -250,10 +251,14 @@ class CustomLinear(nn.Linear):
         return strength_tensor[0]
 
     def _maybe_build_lora_cache(self, weight):
-        """Build LoRA cache on GPU for fast application"""
+        """Build LoRA cache - on CPU or GPU depending on LORA_CPU_CACHE setting"""
+        # Determine target device for cache
+        cache_device = 'cpu' if LORA_CPU_CACHE else weight.device
+        
         if self._lora_cached_deltas is not None:
-            if self._lora_cache_device == weight.device and self._lora_cache_dtype == weight.dtype:
+            if self._lora_cache_device == cache_device and self._lora_cache_dtype == weight.dtype:
                 return
+                
         cached = []
         fp8_safe_dtype = None
         if hasattr(torch, "float8_e4m3fn") and weight.dtype == torch.float8_e4m3fn:
@@ -266,21 +271,30 @@ class CustomLinear(nn.Linear):
         for lora_diff_names in self.lora_diffs:
             if isinstance(lora_diff_names, tuple):
                 mm_dtype = weight.dtype if fp8_safe_dtype is None else fp8_safe_dtype
+                # Compute patch on GPU for speed, then optionally move to CPU for storage
                 lora_diff_0 = getattr(self, lora_diff_names[0]).to(weight.device, mm_dtype)
                 lora_diff_1 = getattr(self, lora_diff_names[1]).to(weight.device, mm_dtype)
                 lora_diff_2 = getattr(self, lora_diff_names[2])
                 patch = torch.mm(
                     lora_diff_0.flatten(start_dim=1),
                     lora_diff_1.flatten(start_dim=1)
-                ).reshape(weight.shape).to(weight.dtype).contiguous()
+                ).reshape(weight.shape).to(weight.dtype)
+                # Move to cache device (CPU or GPU)
+                if LORA_CPU_CACHE:
+                    patch = patch.cpu().contiguous()
+                else:
+                    patch = patch.contiguous()
                 alpha = (float(lora_diff_2) / lora_diff_1.shape[0]) if (lora_diff_2 is not None and lora_diff_1.shape[0] != 0) else 1.0
             else:
                 lora_diff = getattr(self, lora_diff_names)
-                patch = lora_diff.to(weight.device, weight.dtype).contiguous()
+                if LORA_CPU_CACHE:
+                    patch = lora_diff.to('cpu', weight.dtype).contiguous()
+                else:
+                    patch = lora_diff.to(weight.device, weight.dtype).contiguous()
                 alpha = 1.0
             cached.append((patch, alpha))
         self._lora_cached_deltas = cached
-        self._lora_cache_device = weight.device
+        self._lora_cache_device = cache_device
         self._lora_cache_dtype = weight.dtype
 
     def _clear_lora_state(self):
@@ -378,7 +392,7 @@ class CustomLinear(nn.Linear):
         return cache
 
     def _get_weight_with_lora(self, weight):
-        """Apply LoRA using optimized fused operations"""
+        """Apply LoRA using memory-efficient in-place operations"""
         if not getattr(self, "lora_diffs", None):
             return weight
 
@@ -386,52 +400,32 @@ class CustomLinear(nn.Linear):
         if not self._lora_cached_deltas:
             return weight
 
-        # Fast path: batch all LoRA applications together
-        if LORA_USE_FUSED and len(self._lora_cached_deltas) > 1:
-            return self._apply_lora_fused(weight)
+        # Clone weight for in-place modification (required since weight may be shared)
+        weight = weight.clone()
 
-        # Standard path: apply LoRAs one by one
+        # Apply LoRAs with in-place operations to save memory
         for idx, (patch_diff, alpha) in enumerate(self._lora_cached_deltas):
             lora_strength = self._get_lora_strength(idx)
             if isinstance(lora_strength, torch.Tensor):
-                strength_value = lora_strength.to(weight.device, weight.dtype)
+                strength_value = lora_strength.item() if lora_strength.numel() == 1 else lora_strength.mean().item()
             else:
-                strength_value = torch.tensor(lora_strength, device=weight.device, dtype=weight.dtype)
+                strength_value = float(lora_strength)
 
-            if torch.all(strength_value == 0):
+            if abs(strength_value) < 1e-8:
                 continue
 
             scale = strength_value * alpha
-            weight = weight + patch_diff * scale
+            
+            # Move patch to GPU if needed, apply in-place, then delete reference
+            if patch_diff.device != weight.device:
+                patch_gpu = patch_diff.to(weight.device, non_blocking=True)
+                weight.add_(patch_gpu, alpha=scale)
+                del patch_gpu
+            else:
+                weight.add_(patch_diff, alpha=scale)
                 
         return weight
     
-    def _apply_lora_fused(self, weight):
-        """
-        Fused LoRA application - combines all LoRA patches into a single operation.
-        This is faster than applying them one by one.
-        """
-        # Collect all active LoRA contributions
-        total_delta = torch.zeros_like(weight)
-        
-        for idx, (patch_diff, alpha) in enumerate(self._lora_cached_deltas):
-            lora_strength = self._get_lora_strength(idx)
-            if isinstance(lora_strength, torch.Tensor):
-                strength_value = lora_strength.to(weight.device, weight.dtype)
-            else:
-                strength_value = torch.tensor(lora_strength, device=weight.device, dtype=weight.dtype)
-
-            if torch.all(strength_value == 0):
-                continue
-
-            scale = strength_value * alpha
-            # Accumulate into total_delta instead of modifying weight each time
-            total_delta.add_(patch_diff, alpha=scale.item() if scale.numel() == 1 else 1.0)
-            if scale.numel() != 1:
-                total_delta *= scale
-        
-        # Single addition at the end
-        return weight + total_delta
 
     def _compute_grouped_lora(self, input, weight):
         if not grouped_lora_available():
