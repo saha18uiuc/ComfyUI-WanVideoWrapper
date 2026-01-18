@@ -39,8 +39,9 @@ offload_device = mm.unet_offload_device()
 # =============================================================================
 
 class GPUConfig:
-    """Detected GPU configuration for architecture-aware optimizations. Lazy detection."""
+    """Detected GPU configuration for architecture-aware optimizations."""
     _detected = False
+    _logged = False
     arch = "unknown"  # "ampere_dc", "ampere", "ada", "hopper", "unknown"
     sm_version = (0, 0)
     name = ""
@@ -51,8 +52,8 @@ class GPUConfig:
     cudnn_benchmark = True
     
     @classmethod
-    def detect(cls):
-        """Lazy detection - only runs once when first needed."""
+    def _detect_silent(cls):
+        """Silent detection at import time - sets optimizations without logging."""
         if cls._detected:
             return
         cls._detected = True
@@ -93,15 +94,27 @@ class GPUConfig:
                 cls.use_bf16_reduced = False
                 cls.use_scheduler_graphs = False
             
-            # Apply architecture-specific optimizations
+            # Apply architecture-specific optimizations EARLY (before first matmul)
             if cls.use_bf16_reduced and hasattr(torch.backends.cuda.matmul, 'allow_bf16_reduced_precision_reduction'):
                 torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
-            
-            log.info(f"[GPU] {cls.name} (SM {major}.{minor}, {cls.vram_gb:.0f}GB) → {cls.arch}")
         except Exception:
             pass
+    
+    @classmethod
+    def detect(cls):
+        """Ensure detection is done and log info (only logs once)."""
+        cls._detect_silent()
+        if not cls._logged and cls._detected:
+            cls._logged = True
+            major, minor = cls.sm_version
+            if cls.name:
+                log.info(f"[GPU] {cls.name} (SM {major}.{minor}, {cls.vram_gb:.0f}GB) → {cls.arch}")
 
 GPU_CONFIG = GPUConfig
+
+# Silent detection at import time to apply BF16 optimization BEFORE first matmul
+# This is critical for A100 performance - BF16 must be set before first operation
+GPU_CONFIG._detect_silent()
 
 try:
     torch.backends.cuda.matmul.allow_tf32 = True
