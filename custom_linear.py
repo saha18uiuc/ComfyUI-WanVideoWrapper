@@ -24,6 +24,16 @@ _lora_timing_stats = {
     "total_cache_move_time": 0.0,
 }
 
+# Global prefetch stream for async cache moves
+_prefetch_stream = None
+
+def get_prefetch_stream():
+    """Get or create a CUDA stream for async prefetching."""
+    global _prefetch_stream
+    if _prefetch_stream is None and torch.cuda.is_available():
+        _prefetch_stream = torch.cuda.Stream()
+    return _prefetch_stream
+
 def print_lora_timing_stats():
     """Print LoRA timing statistics."""
     if not _LORA_TIMING_ENABLED:
@@ -43,6 +53,10 @@ def print_lora_timing_stats():
 
 MERGE_STATIC_LORA = os.environ.get("WAN_MERGE_STATIC_LORA", "1").strip().lower() in ("1", "true", "yes")
 
+# PIN_LORA_GPU: Keep all LoRA caches permanently on GPU (avoids CPU->GPU transfers)
+# Uses more GPU memory but faster if you have the memory
+PIN_LORA_GPU = os.environ.get("WAN_PIN_LORA_GPU", "0").strip().lower() in ("1", "true", "yes")
+
 # LORA_STREAMING: Build merged delta incrementally with memory cleanup (DEFAULT)
 # Avoids OOM while still caching for speed
 LORA_STREAMING = os.environ.get("WAN_LORA_STREAMING", "1").strip().lower() in ("1", "true", "yes")
@@ -59,6 +73,46 @@ elif LORA_LAZY:
     print(f"[WanVideo LoRA] Lazy mode ENABLED - compute on-demand")
 elif LORA_PREMERGE:
     print(f"[WanVideo LoRA] Pre-merge ENABLED")
+if PIN_LORA_GPU:
+    print(f"[WanVideo LoRA] GPU pinning ENABLED - caches stay on GPU")
+
+
+def pin_all_lora_caches_to_gpu(module, device="cuda"):
+    """
+    Move all LoRA caches to GPU and keep them there.
+    Call this after the first forward pass (when caches are built).
+    
+    This eliminates CPU->GPU transfer overhead at the cost of GPU memory.
+    """
+    moved = 0
+    for name, submodule in module.named_modules():
+        if isinstance(submodule, CustomLinear):
+            if (submodule._lora_cached_deltas is not None and 
+                len(submodule._lora_cached_deltas) > 0):
+                for i, delta in enumerate(submodule._lora_cached_deltas):
+                    if delta.device.type != "cuda":
+                        submodule._lora_cached_deltas[i] = delta.to(device)
+                        moved += 1
+                submodule._lora_cache_device = torch.device(device)
+    if moved > 0:
+        print(f"[WanVideo LoRA] Pinned {moved} LoRA caches to GPU")
+    return moved
+
+
+def clear_all_lora_caches(module):
+    """Clear all LoRA caches to free memory."""
+    cleared = 0
+    for name, submodule in module.named_modules():
+        if isinstance(submodule, CustomLinear):
+            if submodule._lora_cached_deltas is not None:
+                submodule._lora_cached_deltas = None
+                submodule._lora_cache_device = None
+                submodule._lora_cache_dtype = None
+                cleared += 1
+    if cleared > 0:
+        torch.cuda.empty_cache()
+        print(f"[WanVideo LoRA] Cleared {cleared} LoRA caches")
+    return cleared
 
 
 @torch.library.custom_op("wanvideo::apply_lora", mutates_args=())
@@ -569,10 +623,20 @@ class CustomLinear(nn.Linear):
             t0 = time.perf_counter() if _LORA_TIMING_ENABLED else 0
             cached_delta = self._lora_cached_deltas[0]
             
-            # Move cache to correct device if needed (non-blocking for speed)
+            # Move cache to correct device if needed (async on prefetch stream)
             if cached_delta.device != weight.device:
                 move_t0 = time.perf_counter() if _LORA_TIMING_ENABLED else 0
-                cached_delta = cached_delta.to(weight.device, non_blocking=True)
+                
+                # Use dedicated prefetch stream for async transfer
+                stream = get_prefetch_stream()
+                if stream is not None:
+                    with torch.cuda.stream(stream):
+                        cached_delta = cached_delta.to(weight.device, non_blocking=True)
+                    # Wait for transfer to complete before using
+                    torch.cuda.current_stream().wait_stream(stream)
+                else:
+                    cached_delta = cached_delta.to(weight.device, non_blocking=True)
+                
                 self._lora_cached_deltas[0] = cached_delta
                 self._lora_cache_device = weight.device
                 if _LORA_TIMING_ENABLED:
