@@ -10,6 +10,9 @@ from comfy.utils import ProgressBar
 
 from .tokenizers import HuggingfaceTokenizer
 
+# Check for PyTorch's fused RMSNorm (2.4+)
+_HAS_FUSED_RMSNORM = hasattr(F, 'rms_norm')
+
 __all__ = [
     'T5Model',
     'T5Encoder',
@@ -62,6 +65,10 @@ class T5LayerNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x):
+        # Use PyTorch's fused CUDA kernel when available (2.4+)
+        if _HAS_FUSED_RMSNORM:
+            return F.rms_norm(x, (self.dim,), self.weight, self.eps)
+        # Fallback to manual implementation
         x = x * torch.rsqrt(x.float().pow(2).mean(dim=-1, keepdim=True) +
                             self.eps)
         if self.weight.dtype in [torch.float16, torch.bfloat16]:
