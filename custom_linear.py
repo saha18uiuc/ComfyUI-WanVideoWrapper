@@ -23,6 +23,9 @@ _lora_timing_stats = {
     "total_cache_build_time": 0.0,
     "total_cache_hit_time": 0.0,
     "total_cache_move_time": 0.0,
+    # Punica-style A/B cache stats
+    "ab_cache_builds": 0,
+    "ab_cache_hits": 0,
 }
 
 # Global prefetch stream for async cache moves
@@ -49,6 +52,14 @@ def print_lora_timing_stats():
     print(f"  Cache builds: {s['cache_builds']} (total: {s['total_cache_build_time']:.2f}s)")
     print(f"  Cache hits: {s['cache_hits']} (total: {s['total_cache_hit_time']:.4f}s)")
     print(f"  Cache moves: {s['cache_moves']} (total: {s['total_cache_move_time']:.4f}s)")
+    
+    # Punica-style A/B cache stats
+    ab_builds = s.get('ab_cache_builds', 0)
+    ab_hits = s.get('ab_cache_hits', 0)
+    if ab_builds > 0 or ab_hits > 0:
+        total_ab = ab_builds + ab_hits
+        hit_rate = ab_hits / total_ab * 100 if total_ab > 0 else 0
+        print(f"  A/B cache: {ab_hits} hits / {ab_builds} builds ({hit_rate:.1f}% hit rate)")
     
     # GPU vs CPU fallback stats
     if total_adds > 0:
@@ -123,6 +134,7 @@ def pin_all_lora_caches_to_gpu(module, device="cuda"):
 def clear_all_lora_caches(module):
     """Clear all LoRA caches to free memory."""
     cleared = 0
+    ab_cleared = 0
     for name, submodule in module.named_modules():
         if isinstance(submodule, CustomLinear):
             if submodule._lora_cached_deltas is not None:
@@ -130,10 +142,14 @@ def clear_all_lora_caches(module):
                 submodule._lora_cache_device = None
                 submodule._lora_cache_dtype = None
                 cleared += 1
-    if cleared > 0:
+            # Also clear the A/B GPU cache used by on-the-fly mode
+            if hasattr(submodule, '_lora_ab_cache') and submodule._lora_ab_cache:
+                submodule._lora_ab_cache.clear()
+                ab_cleared += 1
+    if cleared > 0 or ab_cleared > 0:
         torch.cuda.empty_cache()
-        print(f"[WanVideo LoRA] Cleared {cleared} LoRA caches")
-    return cleared
+        print(f"[WanVideo LoRA] Cleared {cleared} delta caches, {ab_cleared} A/B caches")
+    return cleared + ab_cleared
 
 
 def premerge_lora_into_weights(module):
@@ -832,16 +848,12 @@ class CustomLinear(nn.Linear):
     
     def _apply_lora_onthefly(self, input, weight, bias):
         """
-        PUNICA-STYLE: Compute W@x + sum(scale * A @ (B @ x)) directly.
+        OPTIMIZED PUNICA-STYLE: Compute W@x + sum(scale * A @ (B @ x)) directly.
         
-        Instead of materializing delta = A @ B (large), we compute:
-        - out = W @ x (main matmul)
-        - lora_out = A @ (B @ x) (two small matmuls)
-        
-        This avoids:
-        - Computing/storing full delta
-        - CPU→GPU transfer of large delta
-        - Only needs small A, B matrices on GPU
+        KEY OPTIMIZATION: Cache A and B on GPU after first transfer!
+        - A, B are small (~0.5MB each for rank 64)
+        - Transfer once, reuse for all subsequent forward passes
+        - Eliminates 30,000+ redundant CPU→GPU transfers
         
         Memory: A is (out_features, rank), B is (rank, in_features)
         vs delta is (out_features, in_features) - much larger!
@@ -849,8 +861,18 @@ class CustomLinear(nn.Linear):
         # Main forward pass
         out = F.linear(input, weight, bias)
         
+        # Initialize GPU cache for LoRA matrices if not exists
+        if not hasattr(self, '_lora_ab_cache'):
+            self._lora_ab_cache = {}
+        
+        target_device = input.device
+        target_dtype = input.dtype
+        cache_key = (target_device.type, getattr(target_device, 'index', 0), target_dtype)
+        
         # Apply each LoRA contribution directly
         lora_contribution = None
+        orig_shape = input.shape
+        x_flat = input.view(-1, orig_shape[-1])  # Flatten once, reuse
         
         for idx, lora_diff_names in enumerate(self.lora_diffs):
             lora_strength = self._get_lora_strength(idx)
@@ -863,66 +885,79 @@ class CustomLinear(nn.Linear):
                 continue
             
             if isinstance(lora_diff_names, tuple):
-                # A is lora_diff_0: (out_features, rank) or similar
-                # B is lora_diff_1: (rank, in_features) or similar
-                A = getattr(self, lora_diff_names[0])  # down projection
-                B = getattr(self, lora_diff_names[1])  # up projection  
-                alpha_val = getattr(self, lora_diff_names[2])
+                # Check cache for GPU copies of A, B
+                lora_cache_key = (cache_key, idx)
                 
-                rank = B.shape[0]
-                alpha = (float(alpha_val) / rank) if (alpha_val is not None and rank != 0) else 1.0
+                if lora_cache_key not in self._lora_ab_cache:
+                    # First time: transfer A, B to GPU and CACHE them
+                    A = getattr(self, lora_diff_names[0])  # (out_features, rank)
+                    B = getattr(self, lora_diff_names[1])  # (rank, in_features)
+                    alpha_val = getattr(self, lora_diff_names[2])
+                    
+                    rank = B.shape[0]
+                    alpha = (float(alpha_val) / rank) if (alpha_val is not None and rank != 0) else 1.0
+                    
+                    # Transfer with non_blocking for better overlap
+                    A_gpu = A.to(target_device, target_dtype, non_blocking=True)
+                    B_gpu = B.to(target_device, target_dtype, non_blocking=True)
+                    
+                    # Pre-compute flattened/transposed versions to avoid redundant ops
+                    A_flat = A_gpu.flatten(start_dim=1)  # (out_features, rank)
+                    B_flat_t = B_gpu.flatten(start_dim=1).t()  # (in_features, rank)
+                    
+                    # Cache everything needed for fast computation
+                    self._lora_ab_cache[lora_cache_key] = {
+                        'A_flat': A_flat,
+                        'B_flat_t': B_flat_t,
+                        'alpha': alpha,
+                    }
+                    del A_gpu, B_gpu  # Only need flattened versions
+                    
+                    if _LORA_TIMING_ENABLED:
+                        _lora_timing_stats['ab_cache_builds'] += 1
+                else:
+                    if _LORA_TIMING_ENABLED:
+                        _lora_timing_stats['ab_cache_hits'] += 1
+                
+                # Fast path: use cached GPU tensors
+                cached = self._lora_ab_cache[lora_cache_key]
+                A_flat = cached['A_flat']
+                B_flat_t = cached['B_flat_t']
+                alpha = cached['alpha']
                 scale = strength_value * alpha
                 
-                # Move A, B to GPU (small tensors!)
-                A_gpu = A.to(input.device, input.dtype)
-                B_gpu = B.to(input.device, input.dtype)
+                # Compute B @ x: (batch*seq, in_features) @ (in_features, rank) = (batch*seq, rank)
+                Bx = torch.mm(x_flat, B_flat_t)
                 
-                # Compute B @ x first (reduces dimension to rank)
-                # input shape: (batch, seq, in_features)
-                # B shape: (rank, in_features) -> need to flatten and reshape
+                # Compute A @ (B @ x): (batch*seq, rank) @ (rank, out_features) = (batch*seq, out_features)
+                ABx = torch.mm(Bx, A_flat.t())
                 
-                # Flatten input for matmul
-                orig_shape = input.shape
-                x_flat = input.view(-1, orig_shape[-1])  # (batch*seq, in_features)
-                
-                # B @ x: (batch*seq, in_features) @ (in_features, rank) = (batch*seq, rank)
-                B_flat = B_gpu.flatten(start_dim=1).t()  # (in_features, rank)
-                Bx = x_flat @ B_flat  # (batch*seq, rank)
-                
-                # A @ (B @ x): (batch*seq, rank) @ (rank, out_features) = (batch*seq, out_features)
-                A_flat = A_gpu.flatten(start_dim=1)  # (out_features, rank)
-                ABx = Bx @ A_flat.t()  # (batch*seq, out_features)
-                
-                # Reshape back
-                ABx = ABx.view(*orig_shape[:-1], -1) * scale  # (batch, seq, out_features)
-                
-                # Accumulate
+                # Scale (fused with accumulation if possible)
                 if lora_contribution is None:
-                    lora_contribution = ABx
+                    lora_contribution = ABx.mul_(scale)
                 else:
-                    lora_contribution = lora_contribution + ABx
+                    lora_contribution.add_(ABx, alpha=scale)
                 
-                # Free GPU memory
-                del A_gpu, B_gpu, Bx, ABx
             else:
-                # Single tensor LoRA (pre-computed delta)
-                lora_diff = getattr(self, lora_diff_names)
-                delta_gpu = lora_diff.to(input.device, input.dtype)
+                # Single tensor LoRA (pre-computed delta) - cache this too
+                delta_cache_key = (cache_key, idx, 'delta')
                 
-                orig_shape = input.shape
-                x_flat = input.view(-1, orig_shape[-1])
-                delta_out = x_flat @ delta_gpu.flatten(start_dim=1).t()
-                delta_out = delta_out.view(*orig_shape[:-1], -1) * strength_value
+                if delta_cache_key not in self._lora_ab_cache:
+                    lora_diff = getattr(self, lora_diff_names)
+                    delta_flat_t = lora_diff.to(target_device, target_dtype, non_blocking=True).flatten(start_dim=1).t()
+                    self._lora_ab_cache[delta_cache_key] = delta_flat_t
+                
+                delta_flat_t = self._lora_ab_cache[delta_cache_key]
+                delta_out = torch.mm(x_flat, delta_flat_t)
                 
                 if lora_contribution is None:
-                    lora_contribution = delta_out
+                    lora_contribution = delta_out.mul_(strength_value)
                 else:
-                    lora_contribution = lora_contribution + delta_out
-                
-                del delta_gpu, delta_out
+                    lora_contribution.add_(delta_out, alpha=strength_value)
         
         if lora_contribution is not None:
-            out = out + lora_contribution
+            # Reshape and add to output
+            out = out + lora_contribution.view(*orig_shape[:-1], -1)
         
         return out
 
