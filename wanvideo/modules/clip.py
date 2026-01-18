@@ -10,12 +10,6 @@ import torchvision.transforms as T
 
 from .attention import attention
 
-# Import fused SiLU*mul - uses CUDA kernel when available
-try:
-    from ..kernels import fused_silu_mul
-    _HAS_FUSED_SILU = True
-except ImportError:
-    _HAS_FUSED_SILU = False
 
 __all__ = [
     'XLMRobertaCLIP',
@@ -112,11 +106,7 @@ class SwiGLU(nn.Module):
         self.fc3 = nn.Linear(mid_dim, dim)
 
     def forward(self, x):
-        # Use JIT-fused SiLU*mul when available
-        if _HAS_FUSED_SILU:
-            x = fused_silu_mul(self.fc1(x), self.fc2(x))
-        else:
-            x = F.silu(self.fc1(x)) * self.fc2(x)
+        x = F.silu(self.fc1(x)) * self.fc2(x)
         x = self.fc3(x)
         return x
 

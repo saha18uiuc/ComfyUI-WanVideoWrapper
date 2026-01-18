@@ -2,12 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# Import fused SiLU*mul - uses CUDA kernel when available
-try:
-    from ..wanvideo.kernels import fused_silu_mul
-    _HAS_FUSED_SILU = True
-except ImportError:
-    _HAS_FUSED_SILU = False
 
 class ChannelLastConv1d(nn.Conv1d):
 
@@ -51,8 +45,5 @@ class ConvMLP(nn.Module):
         self.w3 = ChannelLastConv1d(dim, hidden_dim, bias=False, kernel_size=kernel_size, padding=padding)
 
     def forward(self, x):
-        # Use JIT-fused SiLU*mul when available
-        if _HAS_FUSED_SILU:
-            return self.w2(fused_silu_mul(self.w1(x), self.w3(x)))
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
 

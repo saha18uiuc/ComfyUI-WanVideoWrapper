@@ -7,12 +7,6 @@ from einops import rearrange
 from ..wanvideo.modules.model import WanRMSNorm, attention
 from ..multitalk.multitalk import RotaryPositionalEmbedding1D, normalize_and_scale
 
-# Import fused SiLU*mul - uses CUDA kernel when available, else JIT
-try:
-    from ..wanvideo.kernels import fused_silu_mul
-    _HAS_FUSED_SILU = True
-except ImportError:
-    _HAS_FUSED_SILU = False
 
 class FeedForwardSwiGLU(nn.Module):
     def __init__(
@@ -32,9 +26,6 @@ class FeedForwardSwiGLU(nn.Module):
         self.w3 = nn.Linear(dim, hidden_dim, bias=False)
 
     def forward(self, x):
-        # Use JIT-fused SiLU*mul when available (saves one kernel launch)
-        if _HAS_FUSED_SILU:
-            return self.w2(fused_silu_mul(self.w1(x), self.w3(x)))
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
 class TimestepEmbedder(nn.Module):
