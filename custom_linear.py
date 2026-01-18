@@ -13,11 +13,10 @@ except Exception:
         raise RuntimeError("Grouped LoRA kernel unavailable (missing dependencies).")
 
 MERGE_STATIC_LORA = os.environ.get("WAN_MERGE_STATIC_LORA", "1").strip().lower() in ("1", "true", "yes")
-# Pre-merge LoRA: combine all patches into a single delta at cache build time
-# Uses O(weight_size) memory instead of O(num_patches * weight_size)
-LORA_PREMERGE = os.environ.get("WAN_LORA_PREMERGE", "1").strip().lower() in ("1", "true", "yes")
-# Store merged delta on CPU to save GPU memory (default ON for memory safety)
-LORA_PREMERGE_CPU = os.environ.get("WAN_LORA_PREMERGE_CPU", "1").strip().lower() in ("1", "true", "yes")
+# Pre-merge LoRA: OFF by default - the original caching is actually faster
+# Only enable if you have very few LoRA patches and want to save memory
+LORA_PREMERGE = os.environ.get("WAN_LORA_PREMERGE", "0").strip().lower() in ("1", "true", "yes")
+LORA_PREMERGE_CPU = os.environ.get("WAN_LORA_PREMERGE_CPU", "0").strip().lower() in ("1", "true", "yes")
 
 
 @torch.library.custom_op("wanvideo::apply_lora", mutates_args=())
