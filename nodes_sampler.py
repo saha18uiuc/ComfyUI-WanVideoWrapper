@@ -37,6 +37,11 @@ try:
     torch.backends.cudnn.deterministic = False
     if hasattr(torch, "set_float32_matmul_precision"):
         torch.set_float32_matmul_precision("high")
+    
+    # CUDA memory optimization - reduces fragmentation and OOM risk
+    # Note: This is a fallback if not set in environment before torch import
+    if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,garbage_collection_threshold:0.8"
 except Exception:
     pass
 
