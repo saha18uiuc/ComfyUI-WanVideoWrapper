@@ -23,8 +23,9 @@ Reference: NVIDIA Apex FusedRMSNorm
 import torch
 import os
 
-# Environment variable to disable this kernel if needed
-ENABLE_TRITON_RMSNORM = os.environ.get("WAN_ENABLE_TRITON_RMSNORM", "1").strip().lower() in ("1", "true", "yes")
+# Environment variable to ENABLE this kernel (disabled by default for safety)
+# Set WAN_ENABLE_TRITON_RMSNORM=1 to enable after testing shows it helps
+ENABLE_TRITON_RMSNORM = os.environ.get("WAN_ENABLE_TRITON_RMSNORM", "0").strip().lower() in ("1", "true", "yes")
 
 _HAS_TRITON = False
 try:
@@ -101,33 +102,36 @@ def triton_rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-5) ->
         Normalized tensor of same shape as x
     """
     if not _HAS_TRITON or not ENABLE_TRITON_RMSNORM or not x.is_cuda:
-        # Fallback to PyTorch
         return _pytorch_rms_norm(x, weight, eps)
     
     # Flatten to 2D for kernel
     orig_shape = x.shape
-    x_2d = x.view(-1, x.shape[-1])
+    hidden_dim = x.shape[-1]
+    n_elements = x.numel()
+    n_rows = n_elements // hidden_dim
     
-    # Allocate output
+    # SAFETY: Only use Triton for cases where it's definitely beneficial
+    # 1. Hidden dim must be reasonable (not too small, not too large)
+    # 2. Must have enough rows to amortize kernel launch overhead
+    # 3. Must already be contiguous (avoid memory copy overhead)
+    MIN_ROWS_FOR_TRITON = 512  # Need enough parallelism
+    MIN_HIDDEN_FOR_TRITON = 1024  # Too small = overhead dominates
+    MAX_HIDDEN_FOR_TRITON = 8192  # Too large = memory issues
+    
+    if (n_rows < MIN_ROWS_FOR_TRITON or 
+        hidden_dim < MIN_HIDDEN_FOR_TRITON or 
+        hidden_dim > MAX_HIDDEN_FOR_TRITON or
+        not x.is_contiguous()):
+        # Fallback to PyTorch for edge cases
+        return _pytorch_rms_norm(x, weight, eps)
+    
+    x_2d = x.view(n_rows, hidden_dim)
     y = torch.empty_like(x_2d)
     
-    # Grid: one program per row
-    n_rows = x_2d.shape[0]
-    hidden_dim = x_2d.shape[1]
-    
-    # Choose block size based on hidden dimension
-    # Larger hidden dims can use larger blocks
-    if hidden_dim <= 1024:
-        BLOCK_SIZE = 1024
-    elif hidden_dim <= 2048:
-        BLOCK_SIZE = 1024
-    elif hidden_dim <= 4096:
-        BLOCK_SIZE = 1024
-    else:
-        BLOCK_SIZE = 2048
-    
-    # Ensure x is contiguous
-    x_2d = x_2d.contiguous()
+    # Block size = hidden_dim rounded up to power of 2, capped at 2048
+    # Using bit manipulation instead of triton.next_power_of_2 for safety
+    BLOCK_SIZE = 1 << (hidden_dim - 1).bit_length()
+    BLOCK_SIZE = min(BLOCK_SIZE, 2048)
     
     _rms_norm_fwd_kernel[(n_rows,)](
         x_2d, weight, y,
