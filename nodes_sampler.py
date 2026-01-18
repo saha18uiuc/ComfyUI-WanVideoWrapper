@@ -46,8 +46,7 @@ class GPUConfig:
     vram_gb = 0
     # Optimization flags based on architecture
     use_bf16_reduced = False  # BF16 reduced precision matmul
-    use_scheduler_graphs = True  # CUDA graphs for scheduler step
-    use_fp16_accumulation = False  # FP16 accumulation (Ada optimization)
+    use_scheduler_graphs = True  # CUDA graphs for scheduler step in audio mode
     cudnn_benchmark = True
 
 GPU_CONFIG = GPUConfig()
@@ -69,36 +68,31 @@ def _detect_gpu_config():
             # A100 (Ampere datacenter) - excellent BF16, high memory bandwidth
             GPU_CONFIG.arch = "ampere_dc"
             GPU_CONFIG.use_bf16_reduced = True
-            GPU_CONFIG.use_scheduler_graphs = True
-            GPU_CONFIG.use_fp16_accumulation = False
+            GPU_CONFIG.use_scheduler_graphs = True  # Plenty of VRAM
         elif major == 8 and minor == 9:
-            # L4, RTX 4090 (Ada Lovelace) - optimized for FP8/FP16
+            # L4, RTX 4090 (Ada Lovelace) - keep it simple, avoid experimental settings
             GPU_CONFIG.arch = "ada"
-            GPU_CONFIG.use_bf16_reduced = False  # Ada's tensor cores prefer FP8/FP16
-            GPU_CONFIG.use_scheduler_graphs = False  # Limited VRAM, graphs add pressure
-            GPU_CONFIG.use_fp16_accumulation = True  # Ada excels at FP16
+            GPU_CONFIG.use_bf16_reduced = False  # Don't enable - not optimized for Ada
+            GPU_CONFIG.use_scheduler_graphs = False  # Limited VRAM, graphs add overhead
         elif major == 9:
             # H100 (Hopper) - excellent everything
             GPU_CONFIG.arch = "hopper"
             GPU_CONFIG.use_bf16_reduced = True
             GPU_CONFIG.use_scheduler_graphs = True
-            GPU_CONFIG.use_fp16_accumulation = False
         elif major == 8:
             # Other Ampere (RTX 3090, A10, etc.)
             GPU_CONFIG.arch = "ampere"
             GPU_CONFIG.use_bf16_reduced = True
-            GPU_CONFIG.use_scheduler_graphs = GPU_CONFIG.vram_gb >= 20
-            GPU_CONFIG.use_fp16_accumulation = False
+            GPU_CONFIG.use_scheduler_graphs = GPU_CONFIG.vram_gb >= 24
         else:
             # Older or unknown architecture - conservative settings
             GPU_CONFIG.arch = "unknown"
             GPU_CONFIG.use_bf16_reduced = False
             GPU_CONFIG.use_scheduler_graphs = False
-            GPU_CONFIG.use_fp16_accumulation = False
         
         log.info(f"[GPU Config] {GPU_CONFIG.name} (SM {major}.{minor}, {GPU_CONFIG.vram_gb:.0f}GB)")
         log.info(f"[GPU Config] Arch: {GPU_CONFIG.arch} | BF16: {GPU_CONFIG.use_bf16_reduced} | "
-                 f"Sched graphs: {GPU_CONFIG.use_scheduler_graphs} | FP16 accum: {GPU_CONFIG.use_fp16_accumulation}")
+                 f"Sched graphs (audio): {GPU_CONFIG.use_scheduler_graphs}")
     except Exception as e:
         log.warning(f"[GPU Config] Detection failed: {e}")
 
@@ -118,14 +112,9 @@ try:
     if hasattr(torch.backends.cuda, 'enable_mem_efficient_sdp'):
         torch.backends.cuda.enable_mem_efficient_sdp(True)
     
-    # Architecture-specific matmul optimizations
+    # Architecture-specific matmul optimizations (only enable BF16 on A100/H100)
     if hasattr(torch.backends.cuda.matmul, 'allow_bf16_reduced_precision_reduction'):
         torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = GPU_CONFIG.use_bf16_reduced
-    
-    # Ada Lovelace (L4) specific: enable FP16 accumulation for faster matmuls
-    if GPU_CONFIG.use_fp16_accumulation:
-        if hasattr(torch.backends.cuda.matmul, 'allow_fp16_reduced_precision_reduction'):
-            torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
     
     # CUDA memory optimization
     alloc_conf = "expandable_segments:True,garbage_collection_threshold:0.8"
