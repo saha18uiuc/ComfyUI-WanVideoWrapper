@@ -49,11 +49,6 @@ def print_lora_timing_stats():
     print(f"  Cache hits: {s['cache_hits']} (total: {s['total_cache_hit_time']:.4f}s)")
     print(f"  Cache moves: {s['cache_moves']} (total: {s['total_cache_move_time']:.4f}s)")
     
-    # GPU cache stats
-    gpu_cache_hits = s.get('gpu_cache_hits', 0)
-    if gpu_cache_hits > 0:
-        print(f"  GPU cache hits: {gpu_cache_hits} ✓ ULTRA FAST (no transfer!)")
-    
     # GPU vs CPU fallback stats
     if total_adds > 0:
         gpu_pct = gpu_adds / total_adds * 100
@@ -132,6 +127,78 @@ def clear_all_lora_caches(module):
         torch.cuda.empty_cache()
         print(f"[WanVideo LoRA] Cleared {cleared} LoRA caches")
     return cleared
+
+
+def premerge_lora_into_weights(module):
+    """
+    PRE-MERGE: Merge all LoRA deltas into base weights ONCE at load time.
+    
+    After this, forward pass has ZERO LoRA overhead - just normal linear layers!
+    This is the fastest possible approach.
+    
+    Call this after model loading and before inference.
+    """
+    merged = 0
+    skipped = 0
+    
+    for name, submodule in module.named_modules():
+        if not isinstance(submodule, CustomLinear):
+            continue
+        if not getattr(submodule, "lora_diffs", None):
+            continue
+        if len(submodule.lora_diffs) == 0:
+            continue
+            
+        # Get base weight
+        weight = submodule.weight
+        if weight is None:
+            skipped += 1
+            continue
+            
+        # Compute merged delta on CPU (safe, no OOM)
+        compute_dtype = torch.float32
+        merged_delta = torch.zeros(weight.shape, dtype=compute_dtype, device='cpu')
+        
+        for idx, lora_diff_names in enumerate(submodule.lora_diffs):
+            lora_strength = submodule._get_lora_strength(idx)
+            if isinstance(lora_strength, torch.Tensor):
+                strength_value = lora_strength.item() if lora_strength.numel() == 1 else lora_strength.mean().item()
+            else:
+                strength_value = float(lora_strength)
+            
+            if abs(strength_value) < 1e-8:
+                continue
+            
+            if isinstance(lora_diff_names, tuple):
+                lora_diff_0 = getattr(submodule, lora_diff_names[0])
+                lora_diff_1 = getattr(submodule, lora_diff_names[1])
+                lora_diff_2 = getattr(submodule, lora_diff_names[2])
+                
+                patch = torch.mm(
+                    lora_diff_0.flatten(start_dim=1).to('cpu', compute_dtype),
+                    lora_diff_1.flatten(start_dim=1).to('cpu', compute_dtype)
+                ).reshape(weight.shape)
+                
+                rank = lora_diff_1.shape[0]
+                alpha = (float(lora_diff_2) / rank) if (lora_diff_2 is not None and rank != 0) else 1.0
+                scale = strength_value * alpha
+                
+                merged_delta.add_(patch, alpha=scale)
+                del patch
+            else:
+                lora_diff = getattr(submodule, lora_diff_names)
+                merged_delta.add_(lora_diff.to('cpu', compute_dtype), alpha=strength_value)
+        
+        # Store the merged delta for use during forward pass
+        # (We can't modify FP8 weights in-place, so we store the delta)
+        submodule._lora_cached_deltas = [merged_delta.to(weight.dtype)]
+        submodule._lora_cache_device = torch.device('cpu')
+        submodule._lora_cache_dtype = weight.dtype
+        submodule._premerged = True  # Flag to skip re-computation
+        merged += 1
+    
+    print(f"[WanVideo LoRA] Pre-merged {merged} layers, skipped {skipped}")
+    return merged
 
 
 @torch.library.custom_op("wanvideo::apply_lora", mutates_args=())
@@ -643,21 +710,12 @@ class CustomLinear(nn.Linear):
             cached_delta = self._lora_cached_deltas[0]
             
             if weight.device.type == 'cuda':
-                # Check if cache is already on GPU (FASTEST)
-                if cached_delta.device == weight.device:
-                    # ULTRA FAST PATH: Cache already on GPU, just add!
-                    result = weight + cached_delta
-                    if _LORA_TIMING_ENABLED:
-                        _lora_timing_stats["gpu_cache_hits"] = _lora_timing_stats.get("gpu_cache_hits", 0) + 1
-                else:
-                    # FIRST TIME: Move cache to GPU and KEEP it there
-                    gpu_delta = cached_delta.to(weight.device, weight.dtype, non_blocking=True)
-                    result = weight + gpu_delta
-                    # Keep on GPU for future calls (10GB headroom available!)
-                    self._lora_cached_deltas[0] = gpu_delta
-                    self._lora_cache_device = weight.device
-                    if _LORA_TIMING_ENABLED:
-                        _lora_timing_stats["gpu_additions"] = _lora_timing_stats.get("gpu_additions", 0) + 1
+                # Move delta to GPU, add, DON'T keep (to avoid OOM)
+                gpu_delta = cached_delta.to(weight.device, weight.dtype, non_blocking=True)
+                result = weight + gpu_delta
+                del gpu_delta
+                if _LORA_TIMING_ENABLED:
+                    _lora_timing_stats["gpu_additions"] = _lora_timing_stats.get("gpu_additions", 0) + 1
             else:
                 result = weight + cached_delta.to(weight.dtype)
             
