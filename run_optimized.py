@@ -14,7 +14,10 @@ subprocess.run([sys.executable, "-m", "pip", "install", "-q", "ninja"], check=Tr
 # ============================================================
 # STEP 2: CUDA Memory Optimization (MUST be before torch import!)
 # ============================================================
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,garbage_collection_threshold:0.8"
+# Set both old and new env var names for compatibility
+alloc_conf = "expandable_segments:True,garbage_collection_threshold:0.8"
+os.environ["PYTORCH_ALLOC_CONF"] = alloc_conf
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = alloc_conf  # Deprecated but still works
 
 WORKFLOW_PATH = Path("/content/workflow_api.py")
 COMFY_DIR = Path("/content/ComfyUI")

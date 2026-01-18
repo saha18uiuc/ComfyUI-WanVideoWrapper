@@ -615,7 +615,7 @@ class CustomLinear(nn.Linear):
         
         Cache PERSISTS across device changes - we move it instead of rebuilding.
         """
-        # Check if we have a cached delta (don't invalidate on device change!)
+        # Check if we have a cached delta (always stored on CPU to save GPU memory)
         if (self._lora_cached_deltas is not None and 
             len(self._lora_cached_deltas) > 0 and
             self._lora_cache_dtype == weight.dtype):
@@ -623,28 +623,27 @@ class CustomLinear(nn.Linear):
             t0 = time.perf_counter() if _LORA_TIMING_ENABLED else 0
             cached_delta = self._lora_cached_deltas[0]
             
-            # Move cache to correct device if needed (async on prefetch stream)
-            if cached_delta.device != weight.device:
-                move_t0 = time.perf_counter() if _LORA_TIMING_ENABLED else 0
-                
-                # Use dedicated prefetch stream for async transfer
-                stream = get_prefetch_stream()
-                if stream is not None:
-                    with torch.cuda.stream(stream):
-                        cached_delta = cached_delta.to(weight.device, non_blocking=True)
-                    # Wait for transfer to complete before using
-                    torch.cuda.current_stream().wait_stream(stream)
-                else:
-                    cached_delta = cached_delta.to(weight.device, non_blocking=True)
-                
-                self._lora_cached_deltas[0] = cached_delta
-                self._lora_cache_device = weight.device
-                if _LORA_TIMING_ENABLED:
-                    _lora_timing_stats["cache_moves"] += 1
-                    _lora_timing_stats["total_cache_move_time"] += time.perf_counter() - move_t0
-            
-            # FAST PATH: Use cached delta
-            result = weight + cached_delta
+            # Try GPU addition first, fall back to CPU if OOM
+            if weight.device.type == 'cuda':
+                try:
+                    # Clear fragmented memory first
+                    torch.cuda.empty_cache()
+                    
+                    # Move delta to GPU temporarily (don't store it there)
+                    gpu_delta = cached_delta.to(weight.device, weight.dtype, non_blocking=True)
+                    result = weight + gpu_delta
+                    del gpu_delta  # Free GPU memory immediately
+                    
+                except torch.cuda.OutOfMemoryError:
+                    # OOM fallback: do addition on CPU
+                    torch.cuda.empty_cache()
+                    weight_cpu = weight.to('cpu')
+                    result_cpu = weight_cpu + cached_delta.to(weight_cpu.dtype)
+                    del weight_cpu
+                    result = result_cpu.to(weight.device)
+                    del result_cpu
+            else:
+                result = weight + cached_delta.to(weight.dtype)
             
             if _LORA_TIMING_ENABLED:
                 _lora_timing_stats["cache_hits"] += 1

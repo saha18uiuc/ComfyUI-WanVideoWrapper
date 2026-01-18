@@ -40,8 +40,12 @@ try:
     
     # CUDA memory optimization - reduces fragmentation and OOM risk
     # Note: This is a fallback if not set in environment before torch import
+    # Set memory allocation config (use both old and new names for compatibility)
+    alloc_conf = "expandable_segments:True,garbage_collection_threshold:0.8"
+    if "PYTORCH_ALLOC_CONF" not in os.environ:
+        os.environ["PYTORCH_ALLOC_CONF"] = alloc_conf
     if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
-        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,garbage_collection_threshold:0.8"
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = alloc_conf
 except Exception:
     pass
 
