@@ -13,9 +13,9 @@ except Exception:
         raise RuntimeError("Grouped LoRA kernel unavailable (missing dependencies).")
 
 MERGE_STATIC_LORA = os.environ.get("WAN_MERGE_STATIC_LORA", "1").strip().lower() in ("1", "true", "yes")
-# On-demand LoRA: compute patches from low-rank factors during forward pass
-# This uses minimal GPU memory (only one patch at a time) while staying fast
-LORA_ON_DEMAND = os.environ.get("WAN_LORA_ON_DEMAND", "1").strip().lower() in ("1", "true", "yes")
+# Pre-merge LoRA: combine all patches into a single delta at cache build time
+# Uses O(weight_size) memory instead of O(num_patches * weight_size)
+LORA_PREMERGE = os.environ.get("WAN_LORA_PREMERGE", "1").strip().lower() in ("1", "true", "yes")
 
 
 @torch.library.custom_op("wanvideo::apply_lora", mutates_args=())
@@ -252,14 +252,15 @@ class CustomLinear(nn.Linear):
 
     def _maybe_build_lora_cache(self, weight):
         """
-        Build LoRA cache - either full patches (fast but memory heavy) or 
-        just metadata for on-demand computation (slower but memory efficient).
+        Build LoRA cache. With LORA_PREMERGE=1 (default), all patches are merged
+        into a SINGLE delta tensor at cache time. This uses O(weight_size) memory
+        instead of O(num_patches * weight_size).
         """
         if self._lora_cached_deltas is not None:
             if self._lora_cache_device == weight.device and self._lora_cache_dtype == weight.dtype:
                 return
-                
-        cached = []
+        
+        # Determine compute dtype for FP8 models
         fp8_safe_dtype = None
         if hasattr(torch, "float8_e4m3fn") and weight.dtype == torch.float8_e4m3fn:
             fp8_safe_dtype = torch.float16
@@ -268,18 +269,63 @@ class CustomLinear(nn.Linear):
         if hasattr(torch, "float8_e5m2") and weight.dtype == torch.float8_e5m2:
             fp8_safe_dtype = torch.float16
         
-        for lora_diff_names in self.lora_diffs:
-            if isinstance(lora_diff_names, tuple):
-                if LORA_ON_DEMAND:
-                    # On-demand mode: just store references to low-rank factors
-                    # Patches computed during forward pass
-                    lora_diff_2 = getattr(self, lora_diff_names[2])
-                    rank = getattr(self, lora_diff_names[1]).shape[0]
-                    alpha = (float(lora_diff_2) / rank) if (lora_diff_2 is not None and rank != 0) else 1.0
-                    cached.append((lora_diff_names, alpha, fp8_safe_dtype))
+        mm_dtype = weight.dtype if fp8_safe_dtype is None else fp8_safe_dtype
+        
+        if LORA_PREMERGE:
+            # Pre-merge mode: combine all patches into a single delta
+            # This is memory efficient AND fast - only ONE tensor stored
+            merged_delta = None
+            
+            for idx, lora_diff_names in enumerate(self.lora_diffs):
+                # Get strength for this LoRA
+                lora_strength = self._get_lora_strength(idx)
+                if isinstance(lora_strength, torch.Tensor):
+                    strength_value = lora_strength.item() if lora_strength.numel() == 1 else lora_strength.mean().item()
                 else:
-                    # Pre-compute full patches (original behavior, uses more memory)
-                    mm_dtype = weight.dtype if fp8_safe_dtype is None else fp8_safe_dtype
+                    strength_value = float(lora_strength)
+                
+                if abs(strength_value) < 1e-8:
+                    continue
+                
+                if isinstance(lora_diff_names, tuple):
+                    lora_diff_0 = getattr(self, lora_diff_names[0]).to(weight.device, mm_dtype)
+                    lora_diff_1 = getattr(self, lora_diff_names[1]).to(weight.device, mm_dtype)
+                    lora_diff_2 = getattr(self, lora_diff_names[2])
+                    
+                    # Compute patch
+                    patch = torch.mm(
+                        lora_diff_0.flatten(start_dim=1),
+                        lora_diff_1.flatten(start_dim=1)
+                    ).reshape(weight.shape)
+                    
+                    rank = lora_diff_1.shape[0]
+                    alpha = (float(lora_diff_2) / rank) if (lora_diff_2 is not None and rank != 0) else 1.0
+                    scale = strength_value * alpha
+                    
+                    # Accumulate into merged delta
+                    if merged_delta is None:
+                        merged_delta = patch * scale
+                    else:
+                        merged_delta.add_(patch, alpha=scale)
+                    del patch
+                else:
+                    lora_diff = getattr(self, lora_diff_names).to(weight.device, mm_dtype)
+                    scale = strength_value
+                    if merged_delta is None:
+                        merged_delta = lora_diff * scale
+                    else:
+                        merged_delta.add_(lora_diff, alpha=scale)
+            
+            # Store just the single merged delta
+            if merged_delta is not None:
+                self._lora_cached_deltas = [merged_delta.to(weight.dtype).contiguous()]
+            else:
+                self._lora_cached_deltas = []
+        else:
+            # Original mode: cache individual patches (uses more memory)
+            cached = []
+            for lora_diff_names in self.lora_diffs:
+                if isinstance(lora_diff_names, tuple):
                     lora_diff_0 = getattr(self, lora_diff_names[0]).to(weight.device, mm_dtype)
                     lora_diff_1 = getattr(self, lora_diff_names[1]).to(weight.device, mm_dtype)
                     lora_diff_2 = getattr(self, lora_diff_names[2])
@@ -288,17 +334,13 @@ class CustomLinear(nn.Linear):
                         lora_diff_1.flatten(start_dim=1)
                     ).reshape(weight.shape).to(weight.dtype).contiguous()
                     alpha = (float(lora_diff_2) / lora_diff_1.shape[0]) if (lora_diff_2 is not None and lora_diff_1.shape[0] != 0) else 1.0
-                    cached.append((patch, alpha, None))
-            else:
-                # Non-tuple LoRA (single diff tensor)
-                lora_diff = getattr(self, lora_diff_names)
-                if LORA_ON_DEMAND:
-                    cached.append((lora_diff_names, 1.0, None))
+                    cached.append((patch, alpha))
                 else:
+                    lora_diff = getattr(self, lora_diff_names)
                     patch = lora_diff.to(weight.device, weight.dtype).contiguous()
-                    cached.append((patch, 1.0, None))
+                    cached.append((patch, 1.0))
+            self._lora_cached_deltas = cached
                     
-        self._lora_cached_deltas = cached
         self._lora_cache_device = weight.device
         self._lora_cache_dtype = weight.dtype
 
@@ -314,26 +356,34 @@ class CustomLinear(nn.Linear):
         self.grouped_lora_enabled = False
 
     def _try_merge_static_lora(self):
+        """
+        Attempt to merge LoRA weights directly into base weights.
+        Only works for non-FP8 weights with constant (non-scheduled) strengths.
+        With LORA_PREMERGE, this is less critical since we pre-merge at cache time.
+        """
         if self._static_lora_merged:
             return
         if getattr(self, "lora_diffs", None) is None or not self.lora_diffs:
             return
         if any(self._lora_strength_is_scheduled):
-            return
+            return  # Can't static merge if strengths change per step
+        
         base_weight = self.weight.data if not self.is_gguf else self.weight
+        
+        # FP8 weights can't have LoRA merged directly (precision issues)
         fp8_dtypes = []
         if hasattr(torch, "float8_e4m3fn"):
             fp8_dtypes.append(torch.float8_e4m3fn)
         if hasattr(torch, "float8_e5m2"):
             fp8_dtypes.append(torch.float8_e5m2)
         if base_weight.dtype in fp8_dtypes:
-            return
-        self._maybe_build_lora_cache(base_weight)
-        if not self._lora_cached_deltas:
-            return
+            return  # Skip for FP8 - we'll handle via LORA_PREMERGE at runtime
+        
+        # For non-FP8, merge directly into weights
+        mm_dtype = base_weight.dtype
         merged = False
         with torch.no_grad():
-            for idx, (patch_diff, alpha) in enumerate(self._lora_cached_deltas):
+            for idx, lora_diff_names in enumerate(self.lora_diffs):
                 strength = self._get_lora_strength(idx)
                 if torch.is_tensor(strength):
                     if strength.numel() != 1:
@@ -343,10 +393,26 @@ class CustomLinear(nn.Linear):
                     strength_value = float(strength)
                 if strength_value == 0.0:
                     continue
-                merged = True
+                
+                if isinstance(lora_diff_names, tuple):
+                    lora_diff_0 = getattr(self, lora_diff_names[0]).to(base_weight.device, mm_dtype)
+                    lora_diff_1 = getattr(self, lora_diff_names[1]).to(base_weight.device, mm_dtype)
+                    lora_diff_2 = getattr(self, lora_diff_names[2])
+                    patch = torch.mm(
+                        lora_diff_0.flatten(start_dim=1),
+                        lora_diff_1.flatten(start_dim=1)
+                    ).reshape(base_weight.shape)
+                    rank = lora_diff_1.shape[0]
+                    alpha = (float(lora_diff_2) / rank) if (lora_diff_2 is not None and rank != 0) else 1.0
+                else:
+                    patch = getattr(self, lora_diff_names).to(base_weight.device, mm_dtype)
+                    alpha = 1.0
+                
                 scale = strength_value * alpha
-                patch = patch_diff.to(base_weight.device, base_weight.dtype)
                 base_weight.add_(patch, alpha=scale)
+                merged = True
+                del patch
+                
         if merged:
             self._clear_lora_state()
             self._static_lora_merged = True
@@ -397,7 +463,7 @@ class CustomLinear(nn.Linear):
         return cache
 
     def _get_weight_with_lora(self, weight):
-        """Apply LoRA using memory-efficient in-place operations"""
+        """Apply LoRA using memory-efficient operations"""
         if not getattr(self, "lora_diffs", None):
             return weight
 
@@ -405,53 +471,26 @@ class CustomLinear(nn.Linear):
         if not self._lora_cached_deltas:
             return weight
 
-        # Clone weight for in-place modification (required since weight may be shared)
-        weight = weight.clone()
-
-        # Apply LoRAs with in-place operations to save memory
-        for idx, cached_entry in enumerate(self._lora_cached_deltas):
-            lora_strength = self._get_lora_strength(idx)
-            if isinstance(lora_strength, torch.Tensor):
-                strength_value = lora_strength.item() if lora_strength.numel() == 1 else lora_strength.mean().item()
-            else:
-                strength_value = float(lora_strength)
-
-            if abs(strength_value) < 1e-8:
-                continue
-
-            if LORA_ON_DEMAND and isinstance(cached_entry[0], tuple):
-                # On-demand mode: compute patch from low-rank factors
-                lora_diff_names, alpha, fp8_dtype = cached_entry
-                mm_dtype = weight.dtype if fp8_dtype is None else fp8_dtype
-                
-                # Get low-rank factors and compute patch on GPU
-                lora_diff_0 = getattr(self, lora_diff_names[0]).to(weight.device, mm_dtype)
-                lora_diff_1 = getattr(self, lora_diff_names[1]).to(weight.device, mm_dtype)
-                
-                # Compute patch and apply in-place in one go
-                patch = torch.mm(
-                    lora_diff_0.flatten(start_dim=1),
-                    lora_diff_1.flatten(start_dim=1)
-                ).reshape(weight.shape).to(weight.dtype)
-                
-                scale = strength_value * alpha
-                weight.add_(patch, alpha=scale)
-                del patch  # Free immediately
-                
-            elif LORA_ON_DEMAND and isinstance(cached_entry[0], str):
-                # On-demand mode: single diff tensor
-                lora_diff_name, alpha, _ = cached_entry
-                lora_diff = getattr(self, lora_diff_name).to(weight.device, weight.dtype)
-                scale = strength_value * alpha
-                weight.add_(lora_diff, alpha=scale)
-                
-            else:
-                # Pre-computed mode: use cached patch
-                patch_diff, alpha, _ = cached_entry
+        if LORA_PREMERGE:
+            # Pre-merge mode: single merged delta, already scaled
+            # Just add it to the weight - super fast!
+            merged_delta = self._lora_cached_deltas[0]
+            return weight + merged_delta
+        else:
+            # Original mode: apply each cached patch with its strength
+            weight = weight.clone()
+            for idx, cached_entry in enumerate(self._lora_cached_deltas):
+                patch_diff, alpha = cached_entry
+                lora_strength = self._get_lora_strength(idx)
+                if isinstance(lora_strength, torch.Tensor):
+                    strength_value = lora_strength.item() if lora_strength.numel() == 1 else lora_strength.mean().item()
+                else:
+                    strength_value = float(lora_strength)
+                if abs(strength_value) < 1e-8:
+                    continue
                 scale = strength_value * alpha
                 weight.add_(patch_diff, alpha=scale)
-                
-        return weight
+            return weight
     
 
     def _compute_grouped_lora(self, input, weight):
