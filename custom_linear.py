@@ -1,4 +1,5 @@
 import os
+import time
 import torch
 import torch.nn as nn
 from accelerate import init_empty_weights
@@ -11,6 +12,34 @@ except Exception:
 
     def grouped_lora_forward(*args, **kwargs):
         raise RuntimeError("Grouped LoRA kernel unavailable (missing dependencies).")
+
+# Timing instrumentation for LoRA operations
+_LORA_TIMING_ENABLED = os.environ.get("WAN_LORA_TIMING", "0").strip().lower() in ("1", "true", "yes")
+_lora_timing_stats = {
+    "cache_builds": 0,
+    "cache_hits": 0,
+    "cache_moves": 0,  # Device transfers
+    "total_cache_build_time": 0.0,
+    "total_cache_hit_time": 0.0,
+    "total_cache_move_time": 0.0,
+}
+
+def print_lora_timing_stats():
+    """Print LoRA timing statistics."""
+    if not _LORA_TIMING_ENABLED:
+        print("[LoRA Timing] Timing not enabled. Set WAN_LORA_TIMING=1")
+        return
+    s = _lora_timing_stats
+    print(f"\n[LoRA Timing Statistics]")
+    print(f"  Cache builds: {s['cache_builds']} (total: {s['total_cache_build_time']:.2f}s)")
+    print(f"  Cache hits: {s['cache_hits']} (total: {s['total_cache_hit_time']:.4f}s)")
+    print(f"  Cache moves: {s['cache_moves']} (total: {s['total_cache_move_time']:.4f}s)")
+    if s['cache_hits'] > 0:
+        avg_hit = s['total_cache_hit_time'] / s['cache_hits'] * 1000
+        print(f"  Avg cache hit: {avg_hit:.3f}ms")
+    if s['cache_builds'] > 0:
+        avg_build = s['total_cache_build_time'] / s['cache_builds'] * 1000
+        print(f"  Avg cache build: {avg_build:.1f}ms")
 
 MERGE_STATIC_LORA = os.environ.get("WAN_MERGE_STATIC_LORA", "1").strip().lower() in ("1", "true", "yes")
 
@@ -530,17 +559,37 @@ class CustomLinear(nn.Linear):
         - First call: Build cache by processing patches ONE AT A TIME
         - Subsequent calls: Just add cached delta (FAST)
         
-        This avoids OOM by never having multiple patches in memory simultaneously.
+        Cache PERSISTS across device changes - we move it instead of rebuilding.
         """
-        # Check if we have a valid cached delta
+        # Check if we have a cached delta (don't invalidate on device change!)
         if (self._lora_cached_deltas is not None and 
             len(self._lora_cached_deltas) > 0 and
-            self._lora_cache_device == weight.device and
             self._lora_cache_dtype == weight.dtype):
+            
+            t0 = time.perf_counter() if _LORA_TIMING_ENABLED else 0
+            cached_delta = self._lora_cached_deltas[0]
+            
+            # Move cache to correct device if needed (non-blocking for speed)
+            if cached_delta.device != weight.device:
+                move_t0 = time.perf_counter() if _LORA_TIMING_ENABLED else 0
+                cached_delta = cached_delta.to(weight.device, non_blocking=True)
+                self._lora_cached_deltas[0] = cached_delta
+                self._lora_cache_device = weight.device
+                if _LORA_TIMING_ENABLED:
+                    _lora_timing_stats["cache_moves"] += 1
+                    _lora_timing_stats["total_cache_move_time"] += time.perf_counter() - move_t0
+            
             # FAST PATH: Use cached delta
-            return weight + self._lora_cached_deltas[0]
+            result = weight + cached_delta
+            
+            if _LORA_TIMING_ENABLED:
+                _lora_timing_stats["cache_hits"] += 1
+                _lora_timing_stats["total_cache_hit_time"] += time.perf_counter() - t0
+            
+            return result
         
         # SLOW PATH (first call only): Build the merged delta incrementally
+        build_t0 = time.perf_counter() if _LORA_TIMING_ENABLED else 0
         compute_dtype = torch.float16  # Use FP16 to reduce memory
         
         # Allocate merged delta ONCE - same size as weight
@@ -593,6 +642,10 @@ class CustomLinear(nn.Linear):
         
         # Final cleanup
         torch.cuda.empty_cache()
+        
+        if _LORA_TIMING_ENABLED:
+            _lora_timing_stats["cache_builds"] += 1
+            _lora_timing_stats["total_cache_build_time"] += time.perf_counter() - build_t0
         
         return weight + merged_delta
     
