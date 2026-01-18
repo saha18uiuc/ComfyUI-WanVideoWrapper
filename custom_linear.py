@@ -13,9 +13,9 @@ except Exception:
         raise RuntimeError("Grouped LoRA kernel unavailable (missing dependencies).")
 
 MERGE_STATIC_LORA = os.environ.get("WAN_MERGE_STATIC_LORA", "1").strip().lower() in ("1", "true", "yes")
-# CPU LoRA cache: keeps LoRA patches on CPU to save GPU memory (default ON for memory safety)
-# Patches are moved to GPU one at a time with in-place operations
-LORA_CPU_CACHE = os.environ.get("WAN_LORA_CPU_CACHE", "1").strip().lower() in ("1", "true", "yes")
+# On-demand LoRA: compute patches from low-rank factors during forward pass
+# This uses minimal GPU memory (only one patch at a time) while staying fast
+LORA_ON_DEMAND = os.environ.get("WAN_LORA_ON_DEMAND", "1").strip().lower() in ("1", "true", "yes")
 
 
 @torch.library.custom_op("wanvideo::apply_lora", mutates_args=())
@@ -251,12 +251,12 @@ class CustomLinear(nn.Linear):
         return strength_tensor[0]
 
     def _maybe_build_lora_cache(self, weight):
-        """Build LoRA cache - on CPU or GPU depending on LORA_CPU_CACHE setting"""
-        # Determine target device for cache
-        cache_device = 'cpu' if LORA_CPU_CACHE else weight.device
-        
+        """
+        Build LoRA cache - either full patches (fast but memory heavy) or 
+        just metadata for on-demand computation (slower but memory efficient).
+        """
         if self._lora_cached_deltas is not None:
-            if self._lora_cache_device == cache_device and self._lora_cache_dtype == weight.dtype:
+            if self._lora_cache_device == weight.device and self._lora_cache_dtype == weight.dtype:
                 return
                 
         cached = []
@@ -270,31 +270,36 @@ class CustomLinear(nn.Linear):
         
         for lora_diff_names in self.lora_diffs:
             if isinstance(lora_diff_names, tuple):
-                mm_dtype = weight.dtype if fp8_safe_dtype is None else fp8_safe_dtype
-                # Compute patch on GPU for speed, then optionally move to CPU for storage
-                lora_diff_0 = getattr(self, lora_diff_names[0]).to(weight.device, mm_dtype)
-                lora_diff_1 = getattr(self, lora_diff_names[1]).to(weight.device, mm_dtype)
-                lora_diff_2 = getattr(self, lora_diff_names[2])
-                patch = torch.mm(
-                    lora_diff_0.flatten(start_dim=1),
-                    lora_diff_1.flatten(start_dim=1)
-                ).reshape(weight.shape).to(weight.dtype)
-                # Move to cache device (CPU or GPU)
-                if LORA_CPU_CACHE:
-                    patch = patch.cpu().contiguous()
+                if LORA_ON_DEMAND:
+                    # On-demand mode: just store references to low-rank factors
+                    # Patches computed during forward pass
+                    lora_diff_2 = getattr(self, lora_diff_names[2])
+                    rank = getattr(self, lora_diff_names[1]).shape[0]
+                    alpha = (float(lora_diff_2) / rank) if (lora_diff_2 is not None and rank != 0) else 1.0
+                    cached.append((lora_diff_names, alpha, fp8_safe_dtype))
                 else:
-                    patch = patch.contiguous()
-                alpha = (float(lora_diff_2) / lora_diff_1.shape[0]) if (lora_diff_2 is not None and lora_diff_1.shape[0] != 0) else 1.0
+                    # Pre-compute full patches (original behavior, uses more memory)
+                    mm_dtype = weight.dtype if fp8_safe_dtype is None else fp8_safe_dtype
+                    lora_diff_0 = getattr(self, lora_diff_names[0]).to(weight.device, mm_dtype)
+                    lora_diff_1 = getattr(self, lora_diff_names[1]).to(weight.device, mm_dtype)
+                    lora_diff_2 = getattr(self, lora_diff_names[2])
+                    patch = torch.mm(
+                        lora_diff_0.flatten(start_dim=1),
+                        lora_diff_1.flatten(start_dim=1)
+                    ).reshape(weight.shape).to(weight.dtype).contiguous()
+                    alpha = (float(lora_diff_2) / lora_diff_1.shape[0]) if (lora_diff_2 is not None and lora_diff_1.shape[0] != 0) else 1.0
+                    cached.append((patch, alpha, None))
             else:
+                # Non-tuple LoRA (single diff tensor)
                 lora_diff = getattr(self, lora_diff_names)
-                if LORA_CPU_CACHE:
-                    patch = lora_diff.to('cpu', weight.dtype).contiguous()
+                if LORA_ON_DEMAND:
+                    cached.append((lora_diff_names, 1.0, None))
                 else:
                     patch = lora_diff.to(weight.device, weight.dtype).contiguous()
-                alpha = 1.0
-            cached.append((patch, alpha))
+                    cached.append((patch, 1.0, None))
+                    
         self._lora_cached_deltas = cached
-        self._lora_cache_device = cache_device
+        self._lora_cache_device = weight.device
         self._lora_cache_dtype = weight.dtype
 
     def _clear_lora_state(self):
@@ -404,7 +409,7 @@ class CustomLinear(nn.Linear):
         weight = weight.clone()
 
         # Apply LoRAs with in-place operations to save memory
-        for idx, (patch_diff, alpha) in enumerate(self._lora_cached_deltas):
+        for idx, cached_entry in enumerate(self._lora_cached_deltas):
             lora_strength = self._get_lora_strength(idx)
             if isinstance(lora_strength, torch.Tensor):
                 strength_value = lora_strength.item() if lora_strength.numel() == 1 else lora_strength.mean().item()
@@ -414,14 +419,36 @@ class CustomLinear(nn.Linear):
             if abs(strength_value) < 1e-8:
                 continue
 
-            scale = strength_value * alpha
-            
-            # Move patch to GPU if needed, apply in-place, then delete reference
-            if patch_diff.device != weight.device:
-                patch_gpu = patch_diff.to(weight.device, non_blocking=True)
-                weight.add_(patch_gpu, alpha=scale)
-                del patch_gpu
+            if LORA_ON_DEMAND and isinstance(cached_entry[0], tuple):
+                # On-demand mode: compute patch from low-rank factors
+                lora_diff_names, alpha, fp8_dtype = cached_entry
+                mm_dtype = weight.dtype if fp8_dtype is None else fp8_dtype
+                
+                # Get low-rank factors and compute patch on GPU
+                lora_diff_0 = getattr(self, lora_diff_names[0]).to(weight.device, mm_dtype)
+                lora_diff_1 = getattr(self, lora_diff_names[1]).to(weight.device, mm_dtype)
+                
+                # Compute patch and apply in-place in one go
+                patch = torch.mm(
+                    lora_diff_0.flatten(start_dim=1),
+                    lora_diff_1.flatten(start_dim=1)
+                ).reshape(weight.shape).to(weight.dtype)
+                
+                scale = strength_value * alpha
+                weight.add_(patch, alpha=scale)
+                del patch  # Free immediately
+                
+            elif LORA_ON_DEMAND and isinstance(cached_entry[0], str):
+                # On-demand mode: single diff tensor
+                lora_diff_name, alpha, _ = cached_entry
+                lora_diff = getattr(self, lora_diff_name).to(weight.device, weight.dtype)
+                scale = strength_value * alpha
+                weight.add_(lora_diff, alpha=scale)
+                
             else:
+                # Pre-computed mode: use cached patch
+                patch_diff, alpha, _ = cached_entry
+                scale = strength_value * alpha
                 weight.add_(patch_diff, alpha=scale)
                 
         return weight
