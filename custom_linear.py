@@ -437,6 +437,9 @@ class CustomLinear(nn.Linear):
                 all_tuples = False
         # Cache this check to avoid repeated isinstance() calls in forward()
         self._all_lora_are_tuples = all_tuples
+        # RE-ENABLE grouped LoRA if all LoRAs are tuples (batched kernel is faster!)
+        if all_tuples and grouped_lora_available():
+            self.grouped_lora_enabled = True
 
     def set_lora_strengths(self, lora_strengths, device=torch.device("cpu")):
         self._lora_strength_tensors = []
@@ -871,19 +874,19 @@ class CustomLinear(nn.Linear):
         cache_key = (target_device.type, getattr(target_device, 'index', 0), target_dtype)
         
         # Memory-safe caching: check free memory before caching
-        # Only check periodically (every 100 calls) to avoid overhead
+        # Only check periodically (every 5000 calls) to minimize overhead
         if not hasattr(self, '_ab_cache_check_counter'):
             self._ab_cache_check_counter = 0
             self._ab_cache_enabled = True  # Start with caching enabled
         
         self._ab_cache_check_counter += 1
-        if self._ab_cache_check_counter >= 100:
+        if self._ab_cache_check_counter >= 5000:
             self._ab_cache_check_counter = 0
             if target_device.type == 'cuda':
                 try:
                     free_mem = torch.cuda.get_device_properties(target_device).total_memory - torch.cuda.memory_allocated(target_device)
-                    # Disable caching if less than 2GB free
-                    self._ab_cache_enabled = free_mem > 2 * 1024 * 1024 * 1024
+                    # Disable caching if less than 1.5GB free (more aggressive caching)
+                    self._ab_cache_enabled = free_mem > 1.5 * 1024 * 1024 * 1024
                 except:
                     pass
         
@@ -952,14 +955,13 @@ class CustomLinear(nn.Linear):
                 # Compute B @ x: (batch*seq, in_features) @ (in_features, rank) = (batch*seq, rank)
                 Bx = torch.mm(x_flat, B_flat_t)
                 
-                # Compute A @ (B @ x): (batch*seq, rank) @ (rank, out_features) = (batch*seq, out_features)
-                ABx = torch.mm(Bx, A_flat.t())
-                
-                # Scale (fused with accumulation if possible)
+                # OPTIMIZED: Use addmm for fused matmul+add (single kernel instead of two)
                 if lora_contribution is None:
-                    lora_contribution = ABx.mul_(scale)
+                    # First contribution: just matmul + scale
+                    lora_contribution = torch.mm(Bx, A_flat.t()).mul_(scale)
                 else:
-                    lora_contribution.add_(ABx, alpha=scale)
+                    # Subsequent: fused addmm - computes: lora_contribution + scale * (Bx @ A_flat.t())
+                    torch.addmm(lora_contribution, Bx, A_flat.t(), beta=1.0, alpha=scale, out=lora_contribution)
                 
             else:
                 # Single tensor LoRA (pre-computed delta) - cache this too if enabled
@@ -973,12 +975,11 @@ class CustomLinear(nn.Linear):
                 else:
                     delta_flat_t = self._lora_ab_cache[delta_cache_key]
                 
-                delta_out = torch.mm(x_flat, delta_flat_t)
-                
+                # OPTIMIZED: Use addmm for fused matmul+add when possible
                 if lora_contribution is None:
-                    lora_contribution = delta_out.mul_(strength_value)
+                    lora_contribution = torch.mm(x_flat, delta_flat_t).mul_(strength_value)
                 else:
-                    lora_contribution.add_(delta_out, alpha=strength_value)
+                    torch.addmm(lora_contribution, x_flat, delta_flat_t, beta=1.0, alpha=strength_value, out=lora_contribution)
         
         if lora_contribution is not None:
             # Reshape and add to output
