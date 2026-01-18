@@ -39,7 +39,8 @@ offload_device = mm.unet_offload_device()
 # =============================================================================
 
 class GPUConfig:
-    """Detected GPU configuration for architecture-aware optimizations."""
+    """Detected GPU configuration for architecture-aware optimizations. Lazy detection."""
+    _detected = False
     arch = "unknown"  # "ampere_dc", "ampere", "ada", "hopper", "unknown"
     sm_version = (0, 0)
     name = ""
@@ -48,55 +49,59 @@ class GPUConfig:
     use_bf16_reduced = False  # BF16 reduced precision matmul
     use_scheduler_graphs = True  # CUDA graphs for scheduler step in audio mode
     cudnn_benchmark = True
-
-GPU_CONFIG = GPUConfig()
-
-def _detect_gpu_config():
-    """Detect GPU architecture and set optimization flags."""
-    if not torch.cuda.is_available():
-        return
     
-    try:
-        props = torch.cuda.get_device_properties(0)
-        GPU_CONFIG.sm_version = (props.major, props.minor)
-        GPU_CONFIG.name = props.name
-        GPU_CONFIG.vram_gb = props.total_memory / (1024**3)
+    @classmethod
+    def detect(cls):
+        """Lazy detection - only runs once when first needed."""
+        if cls._detected:
+            return
+        cls._detected = True
         
-        major, minor = GPU_CONFIG.sm_version
+        if not torch.cuda.is_available():
+            return
         
-        if major == 8 and minor == 0:
-            # A100 (Ampere datacenter) - excellent BF16, high memory bandwidth
-            GPU_CONFIG.arch = "ampere_dc"
-            GPU_CONFIG.use_bf16_reduced = True
-            GPU_CONFIG.use_scheduler_graphs = True  # Plenty of VRAM
-        elif major == 8 and minor == 9:
-            # L4, RTX 4090 (Ada Lovelace) - keep it simple, avoid experimental settings
-            GPU_CONFIG.arch = "ada"
-            GPU_CONFIG.use_bf16_reduced = False  # Don't enable - not optimized for Ada
-            GPU_CONFIG.use_scheduler_graphs = False  # Limited VRAM, graphs add overhead
-        elif major == 9:
-            # H100 (Hopper) - excellent everything
-            GPU_CONFIG.arch = "hopper"
-            GPU_CONFIG.use_bf16_reduced = True
-            GPU_CONFIG.use_scheduler_graphs = True
-        elif major == 8:
-            # Other Ampere (RTX 3090, A10, etc.)
-            GPU_CONFIG.arch = "ampere"
-            GPU_CONFIG.use_bf16_reduced = True
-            GPU_CONFIG.use_scheduler_graphs = GPU_CONFIG.vram_gb >= 24
-        else:
-            # Older or unknown architecture - conservative settings
-            GPU_CONFIG.arch = "unknown"
-            GPU_CONFIG.use_bf16_reduced = False
-            GPU_CONFIG.use_scheduler_graphs = False
-        
-        log.info(f"[GPU Config] {GPU_CONFIG.name} (SM {major}.{minor}, {GPU_CONFIG.vram_gb:.0f}GB)")
-        log.info(f"[GPU Config] Arch: {GPU_CONFIG.arch} | BF16: {GPU_CONFIG.use_bf16_reduced} | "
-                 f"Sched graphs (audio): {GPU_CONFIG.use_scheduler_graphs}")
-    except Exception as e:
-        log.warning(f"[GPU Config] Detection failed: {e}")
+        try:
+            props = torch.cuda.get_device_properties(0)
+            cls.sm_version = (props.major, props.minor)
+            cls.name = props.name
+            cls.vram_gb = props.total_memory / (1024**3)
+            
+            major, minor = cls.sm_version
+            
+            if major == 8 and minor == 0:
+                # A100 (Ampere datacenter)
+                cls.arch = "ampere_dc"
+                cls.use_bf16_reduced = True
+                cls.use_scheduler_graphs = True
+            elif major == 8 and minor == 9:
+                # L4, RTX 4090 (Ada Lovelace)
+                cls.arch = "ada"
+                cls.use_bf16_reduced = False
+                cls.use_scheduler_graphs = False
+            elif major == 9:
+                # H100 (Hopper)
+                cls.arch = "hopper"
+                cls.use_bf16_reduced = True
+                cls.use_scheduler_graphs = True
+            elif major == 8:
+                # Other Ampere (RTX 3090, A10, etc.)
+                cls.arch = "ampere"
+                cls.use_bf16_reduced = True
+                cls.use_scheduler_graphs = cls.vram_gb >= 24
+            else:
+                cls.arch = "unknown"
+                cls.use_bf16_reduced = False
+                cls.use_scheduler_graphs = False
+            
+            # Apply architecture-specific optimizations
+            if cls.use_bf16_reduced and hasattr(torch.backends.cuda.matmul, 'allow_bf16_reduced_precision_reduction'):
+                torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
+            
+            log.info(f"[GPU] {cls.name} (SM {major}.{minor}, {cls.vram_gb:.0f}GB) → {cls.arch}")
+        except Exception:
+            pass
 
-_detect_gpu_config()
+GPU_CONFIG = GPUConfig
 
 try:
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -112,9 +117,8 @@ try:
     if hasattr(torch.backends.cuda, 'enable_mem_efficient_sdp'):
         torch.backends.cuda.enable_mem_efficient_sdp(True)
     
-    # Architecture-specific matmul optimizations (only enable BF16 on A100/H100)
-    if hasattr(torch.backends.cuda.matmul, 'allow_bf16_reduced_precision_reduction'):
-        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = GPU_CONFIG.use_bf16_reduced
+    # Architecture-specific matmul optimizations are applied lazily when GPU is first used
+    # This avoids triggering CUDA initialization at import time
     
     # CUDA memory optimization
     alloc_conf = "expandable_segments:True,garbage_collection_threshold:0.8"
@@ -1552,9 +1556,12 @@ class WanVideoSampler:
                     runner.release()
                 graph_runners[key] = None
             
+            # Lazy GPU detection - only when needed
+            GPU_CONFIG.detect()
+            
             # Use GPU_CONFIG to decide on scheduler graphs (architecture-aware)
             if not GPU_CONFIG.use_scheduler_graphs and scheduler_graph_enabled:
-                log.info(f"Also disabling scheduler graphs ({GPU_CONFIG.arch} architecture)")
+                log.info(f"Also disabling scheduler graphs ({GPU_CONFIG.arch} arch)")
                 scheduler_graph_enabled = False
                 if scheduler_graph_runner is not None and hasattr(scheduler_graph_runner, "release"):
                     scheduler_graph_runner.release()
