@@ -1036,6 +1036,41 @@ class WanVideoSampler:
         previous_cache_states = None
         transformer.enable_teacache = transformer.enable_magcache = transformer.enable_easycache = False
         cache_args = teacache_args if teacache_args is not None else cache_args #for backward compatibility on old workflows
+        
+        # Environment variable support for enabling caching without workflow modification
+        env_enable_teacache = os.environ.get("WAN_ENABLE_TEACACHE", "").strip().lower() in ("1", "true", "yes")
+        env_enable_easycache = os.environ.get("WAN_ENABLE_EASYCACHE", "").strip().lower() in ("1", "true", "yes")
+        if cache_args is None and (env_enable_teacache or env_enable_easycache):
+            # Build cache_args from environment variables
+            if env_enable_teacache:
+                teacache_thresh = float(os.environ.get("WAN_TEACACHE_THRESH", "0.3"))
+                teacache_start = int(os.environ.get("WAN_TEACACHE_START_STEP", "1"))
+                teacache_end = int(os.environ.get("WAN_TEACACHE_END_STEP", "-1"))
+                teacache_coefficients = os.environ.get("WAN_TEACACHE_USE_COEFFICIENTS", "1").strip().lower() in ("1", "true", "yes")
+                teacache_mode = os.environ.get("WAN_TEACACHE_MODE", "e")
+                cache_args = {
+                    "cache_type": "TeaCache",
+                    "rel_l1_thresh": teacache_thresh,
+                    "start_step": teacache_start,
+                    "end_step": teacache_end if teacache_end >= 0 else len(timesteps) - 1,
+                    "cache_device": offload_device,
+                    "use_coefficients": teacache_coefficients,
+                    "mode": teacache_mode,
+                }
+                log.info(f"TeaCache enabled via env var: thresh={teacache_thresh}, start={teacache_start}, end={teacache_end}, coefficients={teacache_coefficients}")
+            elif env_enable_easycache:
+                easycache_thresh = float(os.environ.get("WAN_EASYCACHE_THRESH", "0.015"))
+                easycache_start = int(os.environ.get("WAN_EASYCACHE_START_STEP", "1"))
+                easycache_end = int(os.environ.get("WAN_EASYCACHE_END_STEP", "-1"))
+                cache_args = {
+                    "cache_type": "EasyCache",
+                    "easycache_thresh": easycache_thresh,
+                    "start_step": easycache_start,
+                    "end_step": easycache_end if easycache_end >= 0 else len(timesteps) - 1,
+                    "cache_device": offload_device,
+                }
+                log.info(f"EasyCache enabled via env var: thresh={easycache_thresh}, start={easycache_start}, end={easycache_end}")
+        
         if cache_args is not None:
             from .cache_methods.cache_methods import set_transformer_cache_method
             transformer = set_transformer_cache_method(transformer, timesteps, cache_args)
