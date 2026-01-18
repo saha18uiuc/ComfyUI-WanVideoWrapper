@@ -118,7 +118,7 @@ torch.addmm(lora_contribution, Bx, A_flat.t(), beta=1.0, alpha=scale, out=lora_c
 
 ### Architecture-Aware GPU Detection
 
-- **Lazy Detection (`GPUConfig.detect()`)** — Defers GPU property detection until first use, avoiding early CUDA initialization that can add overhead to the first sampling window.
+- **Split Detection (`GPUConfig`)** — Silent detection at import time applies BF16 optimization before first matmul (critical for A100 performance), while logging is deferred until audio detection to keep imports clean.
 
 - **Compute Capability Detection** — Identifies GPU architecture by SM version:
   - SM 8.0 → Ampere datacenter (A100)
