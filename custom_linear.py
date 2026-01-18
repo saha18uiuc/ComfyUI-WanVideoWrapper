@@ -652,14 +652,13 @@ class CustomLinear(nn.Linear):
             
             return result
         
-        # SLOW PATH (first call only): Build the merged delta incrementally
+        # SLOW PATH (first call only): Build the merged delta ON CPU to avoid OOM
+        # This is the CPU-offloaded LoRA technique from QLoRA/PEFT papers
         build_t0 = time.perf_counter() if _LORA_TIMING_ENABLED else 0
-        compute_dtype = torch.float16  # Use FP16 to reduce memory
+        compute_dtype = torch.float32  # CPU compute in FP32 for accuracy
         
-        # Allocate merged delta ONCE - same size as weight
-        merged_delta = torch.zeros(weight.shape, dtype=compute_dtype, device=weight.device)
-        
-        num_patches = len(self.lora_diffs)
+        # Allocate merged delta ON CPU - plenty of RAM there
+        merged_delta = torch.zeros(weight.shape, dtype=compute_dtype, device='cpu')
         
         for idx, lora_diff_names in enumerate(self.lora_diffs):
             # Get strength
@@ -677,46 +676,45 @@ class CustomLinear(nn.Linear):
                 lora_diff_1 = getattr(self, lora_diff_names[1])
                 lora_diff_2 = getattr(self, lora_diff_names[2])
                 
-                # Compute patch in FP16
+                # Compute patch ON CPU - no GPU memory needed!
                 patch = torch.mm(
-                    lora_diff_0.flatten(start_dim=1).to(weight.device, compute_dtype),
-                    lora_diff_1.flatten(start_dim=1).to(weight.device, compute_dtype)
+                    lora_diff_0.flatten(start_dim=1).to('cpu', compute_dtype),
+                    lora_diff_1.flatten(start_dim=1).to('cpu', compute_dtype)
                 ).reshape(weight.shape)
                 
                 rank = lora_diff_1.shape[0]
                 alpha = (float(lora_diff_2) / rank) if (lora_diff_2 is not None and rank != 0) else 1.0
                 scale = strength_value * alpha
                 
-                # Accumulate into merged delta (in-place)
+                # Accumulate into merged delta (in-place, on CPU)
                 merged_delta.add_(patch, alpha=scale)
                 del patch  # Free immediately
             else:
                 lora_diff = getattr(self, lora_diff_names)
-                merged_delta.add_(lora_diff.to(weight.device, compute_dtype), alpha=strength_value)
-            
-            # Periodic memory cleanup to prevent fragmentation
-            if idx % 100 == 99:
-                torch.cuda.empty_cache()
+                merged_delta.add_(lora_diff.to('cpu', compute_dtype), alpha=strength_value)
         
-        # Convert to weight dtype and cache
+        # Convert to weight dtype and KEEP ON CPU for storage
+        # We'll move to GPU only when needed (in the cache hit path above)
         merged_delta = merged_delta.to(weight.dtype)
-        self._lora_cached_deltas = [merged_delta]
-        self._lora_cache_device = weight.device
+        self._lora_cached_deltas = [merged_delta]  # Stored on CPU!
+        self._lora_cache_device = torch.device('cpu')  # Mark as on CPU
         self._lora_cache_dtype = weight.dtype
-        
-        # Final cleanup
-        torch.cuda.empty_cache()
         
         if _LORA_TIMING_ENABLED:
             _lora_timing_stats["cache_builds"] += 1
             _lora_timing_stats["total_cache_build_time"] += time.perf_counter() - build_t0
         
-        return weight + merged_delta
+        # Now move to GPU for this forward pass
+        # The cache hit path above will handle future calls
+        gpu_delta = merged_delta.to(weight.device, non_blocking=True)
+        return weight + gpu_delta
     
     def _apply_lora_lazy(self, weight):
-        """Apply LoRA on-demand without caching. Lowest memory, slowest."""
-        compute_dtype = torch.float16 if weight.is_cuda else weight.dtype
-        result = weight.clone()
+        """Apply LoRA on-demand without caching. Compute on CPU to avoid OOM."""
+        compute_dtype = torch.float32  # CPU compute in FP32
+        
+        # Build merged delta on CPU
+        merged_delta = torch.zeros(weight.shape, dtype=compute_dtype, device='cpu')
         
         for idx, lora_diff_names in enumerate(self.lora_diffs):
             lora_strength = self._get_lora_strength(idx)
@@ -733,22 +731,24 @@ class CustomLinear(nn.Linear):
                 lora_diff_1 = getattr(self, lora_diff_names[1])
                 lora_diff_2 = getattr(self, lora_diff_names[2])
                 
+                # Compute ON CPU
                 patch = torch.mm(
-                    lora_diff_0.flatten(start_dim=1).to(compute_dtype),
-                    lora_diff_1.flatten(start_dim=1).to(compute_dtype)
+                    lora_diff_0.flatten(start_dim=1).to('cpu', compute_dtype),
+                    lora_diff_1.flatten(start_dim=1).to('cpu', compute_dtype)
                 ).reshape(weight.shape)
                 
                 rank = lora_diff_1.shape[0]
                 alpha = (float(lora_diff_2) / rank) if (lora_diff_2 is not None and rank != 0) else 1.0
                 scale = strength_value * alpha
                 
-                result.add_(patch.to(result.dtype), alpha=scale)
+                merged_delta.add_(patch, alpha=scale)
                 del patch
             else:
                 lora_diff = getattr(self, lora_diff_names)
-                result.add_(lora_diff.to(result.dtype), alpha=strength_value)
+                merged_delta.add_(lora_diff.to('cpu', compute_dtype), alpha=strength_value)
         
-        return result
+        # Move only the final result to GPU
+        return weight + merged_delta.to(weight.device, weight.dtype)
     
 
     def _compute_grouped_lora(self, input, weight):
