@@ -437,9 +437,8 @@ class CustomLinear(nn.Linear):
                 all_tuples = False
         # Cache this check to avoid repeated isinstance() calls in forward()
         self._all_lora_are_tuples = all_tuples
-        # RE-ENABLE grouped LoRA if all LoRAs are tuples (batched kernel is faster!)
-        if all_tuples and grouped_lora_available():
-            self.grouped_lora_enabled = True
+        # NOTE: grouped_lora_enabled stays False - the Triton batched kernel
+        # was found to cause OOM/slowdowns in previous testing
 
     def set_lora_strengths(self, lora_strengths, device=torch.device("cpu")):
         self._lora_strength_tensors = []
