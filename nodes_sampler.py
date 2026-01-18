@@ -38,15 +38,21 @@ try:
     if hasattr(torch, "set_float32_matmul_precision"):
         torch.set_float32_matmul_precision("high")
     
-    # Enable BF16 reduced precision reduction (faster matmuls on A100/H100)
-    if hasattr(torch.backends.cuda.matmul, 'allow_bf16_reduced_precision_reduction'):
-        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
-    
-    # Enable Flash SDP when available (faster attention on A100+)
+    # Enable Flash SDP when available (works well on both L4 and A100)
     if hasattr(torch.backends.cuda, 'enable_flash_sdp'):
         torch.backends.cuda.enable_flash_sdp(True)
     if hasattr(torch.backends.cuda, 'enable_mem_efficient_sdp'):
         torch.backends.cuda.enable_mem_efficient_sdp(True)
+    
+    # BF16 reduced precision - ONLY on high-VRAM GPUs (A100 40/80GB, H100)
+    # On L4 (22GB), this can cause slowdowns due to different tensor core optimization
+    if torch.cuda.is_available() and hasattr(torch.backends.cuda.matmul, 'allow_bf16_reduced_precision_reduction'):
+        try:
+            total_vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+            if total_vram_gb >= 40:  # A100 40GB+, H100
+                torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
+        except Exception:
+            pass
     
     # CUDA memory optimization - reduces fragmentation and OOM risk
     # Note: This is a fallback if not set in environment before torch import
@@ -1475,8 +1481,8 @@ class WanVideoSampler:
             log.info("CUDA graphs active for scheduler step.")
 
         def disable_transformer_graphs(reason):
-            """Disable only transformer graphs, keep scheduler graphs enabled."""
-            nonlocal graph_state, graph_runners
+            """Disable transformer graphs. Keep scheduler graphs only on high-VRAM GPUs (>=40GB)."""
+            nonlocal graph_state, graph_runners, scheduler_graph_enabled, scheduler_graph_runner, scheduler_graph_flipped
             if graph_state["enabled"]:
                 log.warning(f"Disabling transformer CUDA graphs: {reason}")
             graph_state["enabled"] = False
@@ -1485,6 +1491,22 @@ class WanVideoSampler:
                 if runner is not None and hasattr(runner, "release"):
                     runner.release()
                 graph_runners[key] = None
+            
+            # Only keep scheduler graphs on high-VRAM GPUs (A100 80GB, H100, etc.)
+            # On lower-VRAM GPUs (L4 22GB), scheduler graphs add overhead
+            try:
+                total_vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+                if total_vram_gb < 40 and scheduler_graph_enabled:
+                    log.info(f"Also disabling scheduler graphs (GPU has {total_vram_gb:.0f}GB VRAM)")
+                    scheduler_graph_enabled = False
+                    if scheduler_graph_runner is not None and hasattr(scheduler_graph_runner, "release"):
+                        scheduler_graph_runner.release()
+                    if scheduler_graph_flipped is not None and hasattr(scheduler_graph_flipped, "release"):
+                        scheduler_graph_flipped.release()
+                    scheduler_graph_runner = None
+                    scheduler_graph_flipped = None
+            except Exception:
+                pass
         
         def disable_graphs(reason):
             """Disable ALL graphs (transformer + scheduler)."""
