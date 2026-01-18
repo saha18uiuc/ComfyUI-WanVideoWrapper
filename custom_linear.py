@@ -219,6 +219,7 @@ class CustomLinear(nn.Linear):
         self._reset_lora_cache()
         self._static_lora_merged = False
         self.lora_diffs = []
+        all_tuples = True
         for i, diff in enumerate(lora_diffs):
             if len(diff) > 1:
                 self.register_buffer(f"lora_diff_{i}_0", diff[0].to(device, self.compute_dtype))
@@ -228,6 +229,9 @@ class CustomLinear(nn.Linear):
             else:
                 self.register_buffer(f"lora_diff_{i}_0", diff[0].to(device, self.compute_dtype))
                 self.lora_diffs.append(f"lora_diff_{i}_0")
+                all_tuples = False
+        # Cache this check to avoid repeated isinstance() calls in forward()
+        self._all_lora_are_tuples = all_tuples
 
     def set_lora_strengths(self, lora_strengths, device=torch.device("cpu")):
         self._lora_strength_tensors = []
@@ -558,10 +562,9 @@ class CustomLinear(nn.Linear):
     def forward(self, input):
         weight = self._prepare_weight(input)
 
-        if self.bias is not None:
-            bias = self.bias.to(input if not self.is_gguf else self.compute_dtype)
-        else:
-            bias = None
+        bias = self.bias
+        if bias is not None:
+            bias = bias.to(input if not self.is_gguf else self.compute_dtype)
 
         # Only apply scale_weight for non-GGUF models
         if not self.is_gguf and self.scale_weight is not None:
@@ -570,24 +573,17 @@ class CustomLinear(nn.Linear):
             else:
                 input = input * self.scale_weight
 
-        use_grouped = (
-            self.grouped_lora_enabled
-            and weight.is_cuda
-            and getattr(self, "lora_diffs", None)
-            and all(isinstance(names, tuple) for names in self.lora_diffs)
-        )
-        grouped_delta = None
-        if use_grouped:
+        # Fast path: check if grouped LoRA is possible (cache the tuple check result)
+        if (self.grouped_lora_enabled and weight.is_cuda and 
+            getattr(self, "lora_diffs", None) and getattr(self, "_all_lora_are_tuples", None)):
             grouped_delta = self._compute_grouped_lora(input, weight)
+            if grouped_delta is not None:
+                out = self._linear_forward_impl(input, weight, bias)
+                return out + grouped_delta.to(out.dtype)
 
-        if grouped_delta is not None:
-            out = self._linear_forward_impl(input, weight, bias)
-            out = out + grouped_delta.to(out.dtype)
-        else:
-            weight = self._get_weight_with_lora(weight)
-            out = self._linear_forward_impl(input, weight, bias)
-        del weight, input, bias
-        return out
+        # Standard path with LoRA
+        weight = self._get_weight_with_lora(weight)
+        return self._linear_forward_impl(input, weight, bias)
 
 def update_lora_step(module, step):
     for name, submodule in module.named_modules():

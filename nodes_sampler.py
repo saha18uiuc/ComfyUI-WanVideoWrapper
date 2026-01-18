@@ -31,6 +31,10 @@ offload_device = mm.unet_offload_device()
 try:
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
+    # Enable cudnn.benchmark for faster convolutions (auto-tunes kernel selection)
+    torch.backends.cudnn.benchmark = True
+    # Disable cudnn.deterministic for speed (only affects reproducibility)
+    torch.backends.cudnn.deterministic = False
     if hasattr(torch, "set_float32_matmul_precision"):
         torch.set_float32_matmul_precision("high")
 except Exception:
@@ -159,6 +163,9 @@ class WanVideoSampler:
         patcher = model
         model = model.model
         transformer = model.diffusion_model
+        
+        # Ensure model is in eval mode (disables dropout, uses running stats for batchnorm)
+        transformer.eval()
 
         dtype = model["base_dtype"]
         weight_dtype = model["weight_dtype"]
