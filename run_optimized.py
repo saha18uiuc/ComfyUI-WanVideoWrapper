@@ -1,4 +1,4 @@
-# --- FULLY OPTIMIZED RUN SCRIPT ---
+# --- PUNICA-STYLE OPTIMIZED RUN SCRIPT ---
 import os
 import sys
 import subprocess
@@ -14,10 +14,9 @@ subprocess.run([sys.executable, "-m", "pip", "install", "-q", "ninja"], check=Tr
 # ============================================================
 # STEP 2: CUDA Memory Optimization (MUST be before torch import!)
 # ============================================================
-# Set both old and new env var names for compatibility
 alloc_conf = "expandable_segments:True,garbage_collection_threshold:0.8"
 os.environ["PYTORCH_ALLOC_CONF"] = alloc_conf
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = alloc_conf  # Deprecated but still works
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = alloc_conf
 
 WORKFLOW_PATH = Path("/content/workflow_api.py")
 COMFY_DIR = Path("/content/ComfyUI")
@@ -39,11 +38,12 @@ os.environ["MAX_STEPS"] = "3"
 os.environ["FRAME_WINDOW_SIZE"] = "25"
 
 # ============================================================
-# STEP 4: LoRA Optimization (all safe defaults)
+# STEP 4: PUNICA-STYLE LORA (KEY OPTIMIZATION!)
 # ============================================================
-os.environ["WAN_LORA_STREAMING"] = "1"  # Incremental cache build (memory safe)
-# os.environ["WAN_PIN_LORA_GPU"] = "1"  # OPTIONAL: Keep caches on GPU (uses more VRAM but faster)
-# os.environ["WAN_LORA_TIMING"] = "1"   # OPTIONAL: Enable timing stats
+# This computes W@x + A@(B@x) instead of (W+delta)@x
+# A,B are cached on GPU after first transfer - eliminates ~30,000 redundant CPU->GPU transfers!
+os.environ["WAN_LORA_ONTHEFLY"] = "1"
+os.environ["WAN_LORA_TIMING"] = "1"  # Show cache stats
 
 # ============================================================
 # STEP 5: Models
@@ -66,16 +66,20 @@ os.environ["REF_IMAGE"] = str(ref_image)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 print("=" * 60)
-print("FULLY OPTIMIZED RUN")
+print("PUNICA-STYLE OPTIMIZED RUN (WITH A/B GPU CACHING)")
 print("=" * 60)
 print(f"512x512 @ 5s, {MAX_FRAMES} frames")
 print()
-print("Optimizations enabled:")
-print("  ✓ Ninja (CUDA kernel compilation)")
-print("  ✓ PYTORCH_CUDA_ALLOC_CONF (reduces fragmentation)")
-print("  ✓ LORA_STREAMING (incremental cache, memory safe)")
-print("  ✓ Cache persistence (no rebuild on CPU<->GPU moves)")
-print("  ✓ Async prefetch stream (overlapped transfers)")
+print("KEY OPTIMIZATION:")
+print("  Instead of transferring A,B 30,000+ times (every forward pass),")
+print("  we cache them on GPU after first use (~1262 transfers total).")
+print()
+print("Enabled:")
+print("  ✓ Punica-style: W@x + A@(B@x) - no large delta")
+print("  ✓ A/B GPU caching - eliminates redundant transfers")
+print("  ✓ Pre-computed flatten/transpose - faster matmuls")
+print("  ✓ non_blocking transfers - async overlap")
+print("  ✓ In-place ops (mul_, add_) - less memory alloc")
 print("  ✓ CUDA fused kernels (RMSNorm, SiLU)")
 print("  ✓ TF32 + cudnn.benchmark")
 print("=" * 60)
