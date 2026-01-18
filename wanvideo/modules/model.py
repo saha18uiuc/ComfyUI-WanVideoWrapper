@@ -288,8 +288,16 @@ def rope_apply_1d(x, grid_sizes, freqs):
         output.append(x_i)
     return torch.stack(output).to(x.dtype)
 
-# Check if PyTorch has fused RMSNorm (2.4+) - this is a fused CUDA kernel
+# Check if PyTorch has fused RMSNorm (2.4+)
 _HAS_FUSED_RMSNORM = hasattr(F, 'rms_norm')
+
+# Try to import custom CUDA RMSNorm kernel
+try:
+    from ..kernels import fused_rmsnorm as cuda_rmsnorm
+    _HAS_CUDA_RMSNORM = True
+except ImportError:
+    _HAS_CUDA_RMSNORM = False
+    cuda_rmsnorm = None
 
 class WanRMSNorm(nn.Module):
 
@@ -308,7 +316,9 @@ class WanRMSNorm(nn.Module):
         if use_chunked:
             return self.forward_chunked(x, num_chunks)
         else:
-            # Use PyTorch's fused F.rms_norm (2.4+) - this IS a CUDA kernel
+            # Try custom CUDA kernel first (fastest), then F.rms_norm, then manual
+            if _HAS_CUDA_RMSNORM and x.is_cuda:
+                return cuda_rmsnorm(x, self.weight, self.eps)
             if _HAS_FUSED_RMSNORM:
                 return F.rms_norm(x, (self.dim,), self.weight, self.eps)
             return self._norm(x.to(self.weight.dtype)) * self.weight
@@ -327,8 +337,10 @@ class WanRMSNorm(nn.Module):
             end_idx = start_idx + size
             chunk = x[:, start_idx:end_idx, :]
             
-            # Use PyTorch's fused F.rms_norm when available
-            if _HAS_FUSED_RMSNORM:
+            # Try custom CUDA kernel first, then F.rms_norm, then manual
+            if _HAS_CUDA_RMSNORM and chunk.is_cuda:
+                output[:, start_idx:end_idx, :] = cuda_rmsnorm(chunk, self.weight, self.eps)
+            elif _HAS_FUSED_RMSNORM:
                 output[:, start_idx:end_idx, :] = F.rms_norm(chunk, (self.dim,), self.weight, self.eps)
             else:
                 norm_factor = torch.rsqrt(chunk.pow(2).mean(dim=-1, keepdim=True) + self.eps)
