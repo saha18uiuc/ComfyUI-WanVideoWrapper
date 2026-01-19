@@ -51,34 +51,43 @@ Benchmark Results
 
 ### Audio-Guided Video Generation (InfiniteTalk/MultiTalk)
 
-**Test Configuration:** 512×512, 5 seconds (120 frames), 2 diffusion steps
+**Test Configuration:** 512×512, 5 seconds (120 frames)
 
 ```
 Environment: Google Colab
 Models: Wan2.1-I2V-14B (fp8), LightX2V LoRA
 Audio: 5-second speech clip
+LoRA Mode: Streaming (default, faster than On-the-Fly)
 ```
 
-#### NVIDIA L4 (22GB VRAM)
+#### NVIDIA A100 (80GB VRAM) — 3 Steps (Same Quality)
 
-| Version | Total Time | First Window | Subsequent Windows | Speedup |
-| ------- | ---------- | ------------ | ------------------ | ------- |
-| Base    | 7.8 min    | ~2:30        | ~22s each          | —       |
-| **Optimized** | **6.4 min** | ~2:05 | ~19s each | **18% faster** |
+| Version | Total Time | Speedup |
+| ------- | ---------- | ------- |
+| Base    | 1.5 min    | —       |
+| **Optimized** | **1.5 min** | Same (no regression) |
 
-#### NVIDIA A100 (80GB VRAM)
+#### NVIDIA A100 (80GB VRAM) — 2 Steps (Speed Priority)
 
-| Version | Total Time | First Window | Subsequent Windows | Speedup |
-| ------- | ---------- | ------------ | ------------------ | ------- |
-| Base    | 3.2 min    | ~45s         | ~16s each          | —       |
-| **Optimized** | **2.8 min** | ~35s | ~14s each | **12% faster** |
+| Version | Total Time | Speedup |
+| ------- | ---------- | ------- |
+| Base    | 3.2 min    | —       |
+| **Optimized** | **2.8 min** | **12% faster** |
+
+#### NVIDIA L4 (22GB VRAM) — 2 Steps
+
+| Version | Total Time | Speedup |
+| ------- | ---------- | ------- |
+| Base    | 7.8 min    | —       |
+| **Optimized** | **6.4 min** | **18% faster** |
 
 
-### LoRA Application Performance
+### LoRA Mode Comparison (A100)
 
-| Metric | Before | After | Improvement |
-| ------ | ------ | ----- | ----------- |
-| CPU→GPU transfers per run | ~30,000 | ~482 | **98% reduction** |
+| Mode | Memory | Speed | Recommended For |
+| ---- | ------ | ----- | --------------- |
+| **Streaming** (default) | Higher | **Faster** | A100, H100, high-VRAM GPUs |
+| On-the-Fly | Lower | Slower | L4, consumer GPUs with OOM |
 | A/B cache hit rate | 0% | 91.7% | — |
 | LoRA overhead per window | ~40s | ~3s | **92% reduction** |
 
@@ -86,22 +95,24 @@ Audio: 5-second speech clip
 Summary of Optimizations
 ------------------------
 
-### Punica-Style LoRA Application
+### Smart LoRA Mode Selection
 
-- **On-the-Fly Computation (`custom_linear.py`)** — Computes `W@x + Σ(scale × A @ (B @ x))` directly instead of materializing full `(W + ΔW)` weight matrices. Eliminates ~14GB of delta tensor allocations for 1262 LoRA patches, reducing memory pressure and enabling efficient streaming.
+- **Streaming Mode (Default, Fastest)** — Builds merged delta `ΔW = Σ(scale × A @ B)` incrementally and caches it. Forward pass uses single `F.linear(x, W + ΔW)` matmul. **Recommended for high-VRAM GPUs (A100, H100).**
 
-- **A/B GPU Caching** — First-access caching of LoRA A and B matrices on GPU with `non_blocking=True` transfers. Subsequent forward passes achieve 91.7% cache hit rate, reducing CPU→GPU transfers from ~30,000 to ~482 per generation run.
+- **On-the-Fly Mode (Lower Memory)** — Computes `W@x + Σ(scale × A @ (B @ x))` directly without materializing delta. Uses 3 matmuls instead of 1, so **slower but uses less peak memory**. Auto-disabled on high-VRAM GPUs unless explicitly requested via `WAN_LORA_ONTHEFLY=1`.
 
-- **Fused Matrix Operations** — Replaces separate `torch.mm()` + `add_()` calls with `torch.addmm()` for single-kernel execution. Reduces kernel launch overhead and improves memory access patterns for LoRA accumulation.
+- **A/B GPU Caching** — When using On-the-Fly mode, caches LoRA A and B matrices on GPU with `non_blocking=True` transfers. Achieves 91.7% cache hit rate, reducing CPU→GPU transfers from ~30,000 to ~482.
 
 ```python
-# Before: Two operations, two kernel launches
-result = torch.mm(Bx, A_flat.t())
-result.mul_(scale)
-lora_contribution.add_(result)
+# Streaming Mode (DEFAULT - FASTER):
+# Single matmul with pre-computed delta
+out = F.linear(input, weight + cached_delta, bias)  # 1 matmul
 
-# After: Single fused operation
-torch.addmm(lora_contribution, Bx, A_flat.t(), beta=1.0, alpha=scale, out=lora_contribution)
+# On-the-Fly Mode (OPTIONAL - LOWER MEMORY):
+# Three matmuls, no delta materialization  
+out = F.linear(input, weight, bias)  # matmul 1
+Bx = torch.mm(x_flat, B_flat_t)      # matmul 2
+out += torch.mm(Bx, A_flat.t()) * s  # matmul 3
 ```
 
 ### Hot Path Micro-Optimizations
@@ -176,7 +187,8 @@ Environment Variables
 
 | Variable | Default | Description |
 | -------- | ------- | ----------- |
-| `WAN_LORA_ONTHEFLY` | `1` | Enable Punica-style on-the-fly LoRA (recommended) |
+| `WAN_LORA_ONTHEFLY` | `0` | Punica-style LoRA (lower memory, slower). Only enable if OOM. |
+| `WAN_LORA_STREAMING` | `1` | Streaming delta merge (faster, default). Recommended. |
 | `WAN_LORA_TIMING` | `0` | Print LoRA timing statistics after generation |
 | `MAX_STEPS` | `3` | Diffusion steps (2 for speed, 3+ for quality) |
 | `MOTION_FRAME` | `25` | Frame overlap between windows (lower = faster) |

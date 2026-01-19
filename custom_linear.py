@@ -95,10 +95,32 @@ LORA_PREMERGE = os.environ.get("WAN_LORA_PREMERGE", "0").strip().lower() in ("1"
 
 # LORA_ONTHEFLY: Punica-style - compute W@x + A@(B@x) directly, no delta storage
 # This avoids large CPU→GPU transfers by using small A,B matrices
-LORA_ONTHEFLY = os.environ.get("WAN_LORA_ONTHEFLY", "0").strip().lower() in ("1", "true", "yes")
+# NOTE: ONTHEFLY is SLOWER than STREAMING due to 3x matmuls, only use for low-VRAM GPUs
+_LORA_ONTHEFLY_ENV = os.environ.get("WAN_LORA_ONTHEFLY", "").strip().lower()
+
+def _get_lora_onthefly_default():
+    """Auto-detect if ONTHEFLY should be used based on GPU VRAM."""
+    if _LORA_ONTHEFLY_ENV in ("1", "true", "yes"):
+        return True
+    if _LORA_ONTHEFLY_ENV in ("0", "false", "no"):
+        return False
+    # Auto-detect: only use ONTHEFLY on low-VRAM GPUs where memory is tight
+    try:
+        import torch
+        if torch.cuda.is_available():
+            vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+            # A100 (40/80GB), H100 (80GB) → use faster STREAMING
+            # L4 (22GB), consumer GPUs → still use STREAMING (default is safe)
+            # Only use ONTHEFLY if explicitly requested
+            return False  # Default to faster STREAMING
+    except:
+        pass
+    return False
+
+LORA_ONTHEFLY = _get_lora_onthefly_default()
 
 if LORA_ONTHEFLY:
-    print(f"[WanVideo LoRA] ON-THE-FLY mode ENABLED - Punica-style A@(B@x), no delta transfer!")
+    print(f"[WanVideo LoRA] ON-THE-FLY mode ENABLED - Punica-style A@(B@x), slower but lower memory")
 elif LORA_STREAMING:
     print(f"[WanVideo LoRA] Streaming merge ENABLED - incremental cache build")
 elif LORA_LAZY:
