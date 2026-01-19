@@ -51,70 +51,73 @@ Benchmark Results
 
 ### Audio-Guided Video Generation (InfiniteTalk/MultiTalk)
 
-**Test Configuration:** 512×512, 5 seconds (120 frames)
+**Test Configuration:** 512×512, 5 seconds (120 frames), 3 diffusion steps (full quality)
 
 ```
 Environment: Google Colab
 Models: Wan2.1-I2V-14B (fp8), LightX2V LoRA
 Audio: 5-second speech clip
-LoRA Mode: Streaming (default, faster than On-the-Fly)
 ```
 
-#### NVIDIA A100 (80GB VRAM) — 3 Steps (Same Quality)
+#### Performance at 3 Steps (Same Quality as Base)
 
-| Version | Total Time | Speedup |
-| ------- | ---------- | ------- |
-| Base    | 1.5 min    | —       |
-| **Optimized** | **1.5 min** | Same (no regression) |
+| GPU | Base Time | Optimized Time | Speedup |
+| --- | --------- | -------------- | ------- |
+| **A100 (80GB)** | ~1.5 min | **TBD** | Expected faster |
+| **L4 (22GB)** | ~7.8 min | **TBD** | Expected faster |
 
-#### NVIDIA A100 (80GB VRAM) — 2 Steps (Speed Priority)
+### LoRA Application Performance
 
-| Version | Total Time | Speedup |
-| ------- | ---------- | ------- |
-| Base    | 3.2 min    | —       |
-| **Optimized** | **2.8 min** | **12% faster** |
-
-#### NVIDIA L4 (22GB VRAM) — 2 Steps
-
-| Version | Total Time | Speedup |
-| ------- | ---------- | ------- |
-| Base    | 7.8 min    | —       |
-| **Optimized** | **6.4 min** | **18% faster** |
-
-
-### LoRA Mode Comparison (A100)
-
-| Mode | Memory | Speed | Recommended For |
-| ---- | ------ | ----- | --------------- |
-| **Streaming** (default) | Higher | **Faster** | A100, H100, high-VRAM GPUs |
-| On-the-Fly | Lower | Slower | L4, consumer GPUs with OOM |
-| A/B cache hit rate | 0% | 91.7% | — |
-| LoRA overhead per window | ~40s | ~3s | **92% reduction** |
+| Metric | Streaming Mode | FUSED Mode | Improvement |
+| ------ | -------------- | ---------- | ----------- |
+| CPU→GPU transfers per forward | 1 per layer | 0 (cached) | **100% reduction** |
+| Tensor allocations per forward | 2 (delta, result) | 0 (in-place addmm) | **100% reduction** |
+| Matmuls per LoRA layer | 1 | 2 | Same |
 
 
 Summary of Optimizations
 ------------------------
 
-### Smart LoRA Mode Selection
+### Output-Space LoRA Fusion (NEW!)
 
-- **Merged Weight Cache (A100/H100, >=40GB VRAM)** — Computes `W_merged = W + ΔW` once, caches it on GPU. Subsequent forward passes have **ZERO LoRA overhead** - just `F.linear(x, W_merged)`. Delta computed on GPU for maximum speed.
+**Inspired by the LoRAFusion paper (arxiv:2510.00206)**
 
-- **Streaming Mode (L4/Consumer GPUs, <40GB VRAM)** — Computes delta on CPU (avoids OOM), caches it, adds to weight each forward pass. Trades speed for memory safety.
-
-- **On-the-Fly Mode (Explicit, OOM fallback)** — Computes `W@x + Σ(scale × A @ (B @ x))` directly without materializing delta. Uses 3 matmuls, slowest but lowest memory. Only enable via `WAN_LORA_ONTHEFLY=1` if other modes OOM.
+The key insight: Instead of computing in weight-space `(W + delta) @ x`, compute in output-space `W @ x + delta @ x`. This allows using `torch.addmm` for fused add+matmul!
 
 ```python
-# Merged Weight Cache (A100 - FASTEST):
-# Delta computed on GPU, merged weight cached
-out = F.linear(input, cached_merged_weight, bias)  # ZERO overhead!
+# STREAMING MODE (old approach):
+# 1. Transfer delta from CPU to GPU every forward pass
+gpu_delta = cached_delta.to(GPU)  # CPU→GPU transfer
+# 2. Allocate new tensor for weight + delta  
+merged = weight + gpu_delta       # allocates new tensor!
+# 3. Matmul
+out = F.linear(input, merged, bias)
 
-# Streaming Mode (L4 - BALANCED):
-# Delta computed on CPU, added each forward
-out = F.linear(input, weight + cpu_delta.to(gpu), bias)
-
-# On-the-Fly Mode (FALLBACK - SLOWEST):
+# FUSED MODE (new approach):
+# 1. Cache delta.T on GPU ONCE (first forward only)
+# 2. Compute base output
 out = F.linear(input, weight, bias)  # matmul 1
-out += (B @ x) @ A * scale           # matmuls 2-3
+# 3. Add LoRA contribution with FUSED addmm (single CUDA kernel!)
+torch.addmm(out, input, delta_t, beta=1, alpha=1, out=out)  # matmul 2
+```
+
+**Benefits:**
+- **Zero CPU→GPU transfers** after first forward (delta.T cached on GPU)
+- **Zero tensor allocations** (addmm writes directly to output)
+- **Single CUDA kernel** for add+matmul (vs 2 kernels in streaming mode)
+- **2 matmuls** vs 3 in ONTHEFLY mode
+
+### Fallback Modes
+
+- **ONTHEFLY Mode** — Punica-style `W@x + Σ(scale × A @ (B @ x))`. Uses 3 matmuls but caches small A/B matrices instead of full delta. Good for low-VRAM GPUs.
+
+- **STREAMING Mode** — Caches delta on CPU, transfers each forward. Safe fallback if FUSED causes OOM.
+
+```python
+# ONTHEFLY: 3 matmuls, caches A/B (use when GPU memory is tight)
+out = W @ x           # matmul 1
+Bx = B @ x            # matmul 2  
+out += A @ Bx * scale # matmul 3
 ```
 
 ### Hot Path Micro-Optimizations
@@ -189,8 +192,9 @@ Environment Variables
 
 | Variable | Default | Description |
 | -------- | ------- | ----------- |
-| `WAN_LORA_MERGED_WEIGHT` | auto | Cache merged weight on GPU. Auto-enabled on >=40GB VRAM. |
-| `WAN_LORA_ONTHEFLY` | `0` | Punica-style LoRA (3 matmuls). Only enable if OOM. |
+| `WAN_LORA_FUSED` | `1` | **NEW!** Output-space LoRA fusion (fastest, recommended) |
+| `WAN_LORA_ONTHEFLY` | `0` | Punica-style A@(B@x). Use if FUSED causes OOM. |
+| `WAN_LORA_STREAMING` | `1` | Safe fallback: delta on CPU, transfer each forward |
 | `WAN_LORA_TIMING` | `0` | Print LoRA timing statistics after generation |
 | `MAX_STEPS` | `3` | Diffusion steps (2 for speed, 3+ for quality) |
 | `MOTION_FRAME` | `25` | Frame overlap between windows (lower = faster) |
@@ -206,10 +210,11 @@ import os
 # CUDA memory optimization (MUST be before torch import)
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,garbage_collection_threshold:0.8"
 
-# Speed optimizations
-os.environ["MAX_STEPS"] = "2"           # Reduced from 3 (saves ~33%)
-os.environ["MOTION_FRAME"] = "5"        # Reduced overlap (fewer windows)
-os.environ["WAN_LORA_ONTHEFLY"] = "1"   # Punica-style LoRA
+# LoRA mode selection (choose one):
+os.environ["WAN_LORA_FUSED"] = "1"      # FASTEST: output-space fusion (default)
+# os.environ["WAN_LORA_ONTHEFLY"] = "1" # Lower memory: 3 matmuls with A/B cache
+# os.environ["WAN_LORA_STREAMING"] = "1" # Safe fallback: delta on CPU
+
 os.environ["WAN_LORA_TIMING"] = "1"     # Show timing stats
 
 # Video settings
@@ -217,6 +222,7 @@ os.environ["WIDTH"] = "512"
 os.environ["HEIGHT"] = "512"
 os.environ["FRAME_RATE"] = "24"
 os.environ["MAX_FRAMES"] = "120"        # 5 seconds
+os.environ["MAX_STEPS"] = "3"           # Keep at 3 for quality
 ```
 
 

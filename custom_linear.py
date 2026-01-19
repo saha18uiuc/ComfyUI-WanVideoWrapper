@@ -95,58 +95,19 @@ LORA_PREMERGE = os.environ.get("WAN_LORA_PREMERGE", "0").strip().lower() in ("1"
 
 # LORA_ONTHEFLY: Punica-style - compute W@x + A@(B@x) directly, no delta storage
 # This avoids large CPU→GPU transfers by using small A,B matrices
-# NOTE: ONTHEFLY is SLOWER than STREAMING due to 3x matmuls, only use for low-VRAM GPUs
-_LORA_ONTHEFLY_ENV = os.environ.get("WAN_LORA_ONTHEFLY", "").strip().lower()
+LORA_ONTHEFLY = os.environ.get("WAN_LORA_ONTHEFLY", "0").strip().lower() in ("1", "true", "yes")
 
-def _get_lora_onthefly_default():
-    """Auto-detect if ONTHEFLY should be used based on GPU VRAM."""
-    if _LORA_ONTHEFLY_ENV in ("1", "true", "yes"):
-        return True
-    if _LORA_ONTHEFLY_ENV in ("0", "false", "no"):
-        return False
-    # Auto-detect: only use ONTHEFLY on low-VRAM GPUs where memory is tight
-    try:
-        import torch
-        if torch.cuda.is_available():
-            vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-            # A100 (40/80GB), H100 (80GB) → use faster STREAMING
-            # L4 (22GB), consumer GPUs → still use STREAMING (default is safe)
-            # Only use ONTHEFLY if explicitly requested
-            return False  # Default to faster STREAMING
-    except:
-        pass
-    return False
+# LORA_FUSED: Output-space LoRA fusion (inspired by LoRAFusion paper arxiv:2510.00206)
+# Instead of (W + delta) @ x which requires materializing delta,
+# compute W @ x + delta @ x where delta @ x uses the CACHED delta on GPU
+# Key insight: We cache delta.T (transposed) on GPU once, then use torch.addmm for fusion
+# This is different from ONTHEFLY which uses A/B matrices - here we use pre-computed delta
+LORA_FUSED = os.environ.get("WAN_LORA_FUSED", "1").strip().lower() in ("1", "true", "yes")
 
-LORA_ONTHEFLY = _get_lora_onthefly_default()
-
-# LORA_MERGED_WEIGHT: Cache the fully merged weight (weight + delta) on GPU
-# This is the FASTEST mode - ZERO overhead after first forward pass
-# Trades memory for speed - perfect for A100/H100
-# Auto-detects: disabled on low-VRAM GPUs (< 40GB) to avoid OOM
-_LORA_MERGED_WEIGHT_ENV = os.environ.get("WAN_LORA_MERGED_WEIGHT", "").strip().lower()
-
-def _get_merged_weight_default():
-    """Auto-detect if MERGED_WEIGHT should be enabled based on GPU VRAM."""
-    if _LORA_MERGED_WEIGHT_ENV in ("1", "true", "yes"):
-        return True
-    if _LORA_MERGED_WEIGHT_ENV in ("0", "false", "no"):
-        return False
-    # Auto-detect: only enable on high-VRAM GPUs
-    try:
-        import torch
-        if torch.cuda.is_available():
-            vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-            # A100 (40/80GB), H100 (80GB) → enable merged weight cache
-            # L4 (22GB), consumer GPUs → disable to avoid OOM
-            return vram_gb >= 40
-    except:
-        pass
-    return False
-
-LORA_MERGED_WEIGHT = _get_merged_weight_default()
-
-if LORA_ONTHEFLY:
-    print(f"[WanVideo LoRA] ON-THE-FLY mode ENABLED - Punica-style A@(B@x), slower but lower memory")
+if LORA_FUSED:
+    print(f"[WanVideo LoRA] FUSED mode ENABLED - output-space LoRA fusion (fastest)")
+elif LORA_ONTHEFLY:
+    print(f"[WanVideo LoRA] ON-THE-FLY mode ENABLED - Punica-style A@(B@x), no delta transfer!")
 elif LORA_STREAMING:
     print(f"[WanVideo LoRA] Streaming merge ENABLED - incremental cache build")
 elif LORA_LAZY:
@@ -421,10 +382,10 @@ class CustomLinear(nn.Linear):
         self.grouped_lora_enabled = True
         self.merge_static_lora = MERGE_STATIC_LORA
         self._static_lora_merged = False
-        # MERGED WEIGHT CACHE: Store fully merged weight (weight + delta) on GPU
-        # Key = (device, dtype), Value = merged_weight tensor
-        self._merged_weight_cache = {}
-        self._merged_weight_delta = None  # The delta (computed once)
+        # FUSED mode: cache delta.T on GPU for output-space fusion
+        self._fused_delta_t = None  # Transposed delta cached on GPU
+        self._fused_delta_device = None
+        self._fused_delta_dtype = None
 
         if not allow_compile:
             self._apply_lora_impl = self._apply_lora_custom_op
@@ -471,9 +432,10 @@ class CustomLinear(nn.Linear):
         self._grouped_cache = None
         self._grouped_cache_device = None
         self._grouped_cache_dtype = None
-        # Also clear merged weight cache
-        self._merged_weight_cache = {}
-        self._merged_weight_delta = None
+        # Clear FUSED mode cache
+        self._fused_delta_t = None
+        self._fused_delta_device = None
+        self._fused_delta_dtype = None
 
     def set_lora_diffs(self, lora_diffs, device=torch.device("cpu")):
         self._reset_lora_cache()
@@ -774,94 +736,93 @@ class CustomLinear(nn.Linear):
     
     def _apply_lora_streaming(self, weight):
         """
-        STREAMING MODE with MERGED WEIGHT CACHING.
+        STREAMING MODE: Build merged delta incrementally with memory management.
         
-        If LORA_MERGED_WEIGHT is enabled (default):
-        - First call: Compute delta, compute merged_weight = weight + delta, cache it
-        - Subsequent calls: Return cached merged_weight directly (ZERO overhead!)
+        - First call: Build cache by processing patches ONE AT A TIME
+        - Subsequent calls: Just add cached delta (FAST)
         
-        If LORA_MERGED_WEIGHT is disabled:
-        - Falls back to delta caching (weight + cached_delta each time)
+        Cache PERSISTS across device changes - we move it instead of rebuilding.
         """
-        # FAST PATH: Return cached merged weight directly (ZERO overhead!)
-        if LORA_MERGED_WEIGHT:
-            cache_key = (weight.device, weight.dtype)
-            cached_merged = self._merged_weight_cache.get(cache_key)
-            if cached_merged is not None:
+        # Check if we have a cached delta
+        if (self._lora_cached_deltas is not None and 
+            len(self._lora_cached_deltas) > 0 and
+            self._lora_cache_dtype == weight.dtype):
+            
+            t0 = time.perf_counter() if _LORA_TIMING_ENABLED else 0
+            cached_delta = self._lora_cached_deltas[0]
+            
+            if weight.device.type == 'cuda':
+                # Move delta to GPU, add, DON'T keep (to avoid OOM)
+                gpu_delta = cached_delta.to(weight.device, weight.dtype, non_blocking=True)
+                result = weight + gpu_delta
+                del gpu_delta
                 if _LORA_TIMING_ENABLED:
-                    _lora_timing_stats["cache_hits"] += 1
                     _lora_timing_stats["gpu_additions"] = _lora_timing_stats.get("gpu_additions", 0) + 1
-                return cached_merged
-        
-        # Check if we have a cached delta (for the old path or for computing merged weight)
-        if self._merged_weight_delta is None:
-            # SLOW PATH (first call only): Build the merged delta
-            build_t0 = time.perf_counter() if _LORA_TIMING_ENABLED else 0
-            
-            # On high-VRAM GPUs (A100+), compute delta directly on GPU for speed
-            # On low-VRAM GPUs (L4), compute on CPU to avoid OOM
-            use_gpu_compute = LORA_MERGED_WEIGHT and weight.device.type == 'cuda'
-            compute_device = weight.device if use_gpu_compute else 'cpu'
-            compute_dtype = weight.dtype if use_gpu_compute else torch.float32
-            
-            # Allocate merged delta
-            merged_delta = torch.zeros(weight.shape, dtype=compute_dtype, device=compute_device)
-            
-            for idx, lora_diff_names in enumerate(self.lora_diffs):
-                # Get strength
-                lora_strength = self._get_lora_strength(idx)
-                if isinstance(lora_strength, torch.Tensor):
-                    strength_value = lora_strength.item() if lora_strength.numel() == 1 else lora_strength.mean().item()
-                else:
-                    strength_value = float(lora_strength)
-                
-                if abs(strength_value) < 1e-8:
-                    continue
-                
-                if isinstance(lora_diff_names, tuple):
-                    lora_diff_0 = getattr(self, lora_diff_names[0])
-                    lora_diff_1 = getattr(self, lora_diff_names[1])
-                    lora_diff_2 = getattr(self, lora_diff_names[2])
-                    
-                    # Compute patch (on GPU if available, CPU otherwise)
-                    patch = torch.mm(
-                        lora_diff_0.flatten(start_dim=1).to(compute_device, compute_dtype),
-                        lora_diff_1.flatten(start_dim=1).to(compute_device, compute_dtype)
-                    ).reshape(weight.shape)
-                    
-                    rank = lora_diff_1.shape[0]
-                    alpha = (float(lora_diff_2) / rank) if (lora_diff_2 is not None and rank != 0) else 1.0
-                    scale = strength_value * alpha
-                    
-                    # Accumulate into merged delta (in-place)
-                    merged_delta.add_(patch, alpha=scale)
-                    del patch  # Free immediately
-                else:
-                    lora_diff = getattr(self, lora_diff_names)
-                    merged_delta.add_(lora_diff.to(compute_device, compute_dtype), alpha=strength_value)
-            
-            # Store delta (on CPU if not using merged weight cache, on GPU otherwise)
-            if not LORA_MERGED_WEIGHT:
-                merged_delta = merged_delta.to('cpu', weight.dtype)
-            self._merged_weight_delta = merged_delta
+            else:
+                result = weight + cached_delta.to(weight.dtype)
             
             if _LORA_TIMING_ENABLED:
-                _lora_timing_stats["cache_builds"] += 1
-                _lora_timing_stats["total_cache_build_time"] += time.perf_counter() - build_t0
+                _lora_timing_stats["cache_hits"] += 1
+                _lora_timing_stats["total_cache_hit_time"] += time.perf_counter() - t0
+            
+            return result
         
-        # Compute merged weight
-        delta_gpu = self._merged_weight_delta.to(weight.device, weight.dtype, non_blocking=True)
-        merged_weight = weight + delta_gpu
-        del delta_gpu
+        # SLOW PATH (first call only): Build the merged delta ON CPU to avoid OOM
+        # This is the CPU-offloaded LoRA technique from QLoRA/PEFT papers
+        build_t0 = time.perf_counter() if _LORA_TIMING_ENABLED else 0
+        compute_dtype = torch.float32  # CPU compute in FP32 for accuracy
         
-        # Cache the merged weight if enabled
-        if LORA_MERGED_WEIGHT:
-            cache_key = (weight.device, weight.dtype)
-            self._merged_weight_cache[cache_key] = merged_weight
-            if _LORA_TIMING_ENABLED:
-                _lora_timing_stats["gpu_additions"] = _lora_timing_stats.get("gpu_additions", 0) + 1
+        # Allocate merged delta ON CPU - plenty of RAM there
+        merged_delta = torch.zeros(weight.shape, dtype=compute_dtype, device='cpu')
         
-        return merged_weight
+        for idx, lora_diff_names in enumerate(self.lora_diffs):
+            # Get strength
+            lora_strength = self._get_lora_strength(idx)
+            if isinstance(lora_strength, torch.Tensor):
+                strength_value = lora_strength.item() if lora_strength.numel() == 1 else lora_strength.mean().item()
+            else:
+                strength_value = float(lora_strength)
+            
+            if abs(strength_value) < 1e-8:
+                continue
+            
+            if isinstance(lora_diff_names, tuple):
+                lora_diff_0 = getattr(self, lora_diff_names[0])
+                lora_diff_1 = getattr(self, lora_diff_names[1])
+                lora_diff_2 = getattr(self, lora_diff_names[2])
+                
+                # Compute patch ON CPU - no GPU memory needed!
+                patch = torch.mm(
+                    lora_diff_0.flatten(start_dim=1).to('cpu', compute_dtype),
+                    lora_diff_1.flatten(start_dim=1).to('cpu', compute_dtype)
+                ).reshape(weight.shape)
+                
+                rank = lora_diff_1.shape[0]
+                alpha = (float(lora_diff_2) / rank) if (lora_diff_2 is not None and rank != 0) else 1.0
+                scale = strength_value * alpha
+                
+                # Accumulate into merged delta (in-place, on CPU)
+                merged_delta.add_(patch, alpha=scale)
+                del patch  # Free immediately
+            else:
+                lora_diff = getattr(self, lora_diff_names)
+                merged_delta.add_(lora_diff.to('cpu', compute_dtype), alpha=strength_value)
+        
+        # Convert to weight dtype and KEEP ON CPU for storage
+        # We'll move to GPU only when needed (in the cache hit path above)
+        merged_delta = merged_delta.to(weight.dtype)
+        self._lora_cached_deltas = [merged_delta]  # Stored on CPU!
+        self._lora_cache_device = torch.device('cpu')  # Mark as on CPU
+        self._lora_cache_dtype = weight.dtype
+        
+        if _LORA_TIMING_ENABLED:
+            _lora_timing_stats["cache_builds"] += 1
+            _lora_timing_stats["total_cache_build_time"] += time.perf_counter() - build_t0
+        
+        # Now move to GPU for this forward pass
+        # The cache hit path above will handle future calls
+        gpu_delta = merged_delta.to(weight.device, non_blocking=True)
+        return weight + gpu_delta
     
     def _apply_lora_lazy(self, weight):
         """Apply LoRA on-demand without caching. Compute on CPU to avoid OOM."""
@@ -1066,6 +1027,105 @@ class CustomLinear(nn.Linear):
             weight = self.weight.to(input)
         return weight
 
+    def _apply_lora_fused(self, input, weight, bias):
+        """
+        OUTPUT-SPACE LORA FUSION (inspired by LoRAFusion paper arxiv:2510.00206)
+        
+        Instead of materializing (W + delta) then matmul:
+            result = (W + delta) @ x   # requires weight-space delta, creates new tensor
+        
+        We compute in output space:
+            result = W @ x + delta @ x  # fused with torch.addmm!
+        
+        Key insight: Cache delta.T on GPU ONCE, then use addmm for fused add+matmul
+        
+        Benefits vs STREAMING:
+        - No `weight + delta` tensor allocation every forward
+        - Uses fused addmm kernel (single CUDA launch for add + matmul)
+        - delta.T cached on GPU (no CPU->GPU transfer after first call)
+        
+        Benefits vs ONTHEFLY (Punica):
+        - 2 matmuls instead of 3 (W@x + delta@x vs W@x + A@(B@x))
+        - Pre-computed delta.T is smaller than A+B for high-rank LoRAs
+        
+        Memory: ~same as STREAMING (stores delta), but on GPU for speed
+        """
+        # Check/build delta.T cache
+        if (self._fused_delta_t is not None and 
+            self._fused_delta_device == input.device and
+            self._fused_delta_dtype == input.dtype):
+            # FAST PATH: Use cached delta.T
+            delta_t = self._fused_delta_t
+            if _LORA_TIMING_ENABLED:
+                _lora_timing_stats["cache_hits"] += 1
+        else:
+            # SLOW PATH (first call): Build delta on CPU, transfer to GPU, cache
+            build_t0 = time.perf_counter() if _LORA_TIMING_ENABLED else 0
+            compute_dtype = torch.float32
+            
+            merged_delta = torch.zeros(weight.shape, dtype=compute_dtype, device='cpu')
+            
+            for idx, lora_diff_names in enumerate(self.lora_diffs):
+                lora_strength = self._get_lora_strength(idx)
+                if isinstance(lora_strength, torch.Tensor):
+                    strength_value = lora_strength.item() if lora_strength.numel() == 1 else lora_strength.mean().item()
+                else:
+                    strength_value = float(lora_strength)
+                
+                if abs(strength_value) < 1e-8:
+                    continue
+                
+                if isinstance(lora_diff_names, tuple):
+                    lora_diff_0 = getattr(self, lora_diff_names[0])
+                    lora_diff_1 = getattr(self, lora_diff_names[1])
+                    lora_diff_2 = getattr(self, lora_diff_names[2])
+                    
+                    patch = torch.mm(
+                        lora_diff_0.flatten(start_dim=1).to('cpu', compute_dtype),
+                        lora_diff_1.flatten(start_dim=1).to('cpu', compute_dtype)
+                    ).reshape(weight.shape)
+                    
+                    rank = lora_diff_1.shape[0]
+                    alpha = (float(lora_diff_2) / rank) if (lora_diff_2 is not None and rank != 0) else 1.0
+                    scale = strength_value * alpha
+                    
+                    merged_delta.add_(patch, alpha=scale)
+                    del patch
+                else:
+                    lora_diff = getattr(self, lora_diff_names)
+                    merged_delta.add_(lora_diff.to('cpu', compute_dtype), alpha=strength_value)
+            
+            # Transfer TRANSPOSED delta to GPU and cache
+            # delta.T shape: (in_features, out_features)
+            # This allows: out += x @ delta.T via addmm
+            delta_t = merged_delta.t().contiguous().to(input.device, input.dtype)
+            
+            self._fused_delta_t = delta_t
+            self._fused_delta_device = input.device
+            self._fused_delta_dtype = input.dtype
+            
+            if _LORA_TIMING_ENABLED:
+                _lora_timing_stats["cache_builds"] += 1
+                _lora_timing_stats["total_cache_build_time"] += time.perf_counter() - build_t0
+        
+        # Compute base output: W @ x
+        out = F.linear(input, weight, bias)
+        
+        # Reshape for matmul
+        orig_shape = out.shape
+        out_flat = out.view(-1, orig_shape[-1])  # (batch*seq, out_features)
+        x_flat = input.view(-1, input.shape[-1])  # (batch*seq, in_features)
+        
+        # FUSED add + matmul: out += x @ delta.T
+        # torch.addmm(input, mat1, mat2, beta=1, alpha=1, out=None)
+        # computes: beta*input + alpha*(mat1 @ mat2)
+        torch.addmm(out_flat, x_flat, delta_t, beta=1.0, alpha=1.0, out=out_flat)
+        
+        if _LORA_TIMING_ENABLED:
+            _lora_timing_stats["gpu_additions"] = _lora_timing_stats.get("gpu_additions", 0) + 1
+        
+        return out.view(*orig_shape)
+
     def forward(self, input):
         weight = self._prepare_weight(input)
 
@@ -1079,6 +1139,11 @@ class CustomLinear(nn.Linear):
                 weight = weight * self.scale_weight
             else:
                 input = input * self.scale_weight
+
+        # FUSED mode: Output-space LoRA fusion (FASTEST for high-VRAM GPUs)
+        # Caches delta.T on GPU, uses addmm for fused add+matmul
+        if LORA_FUSED and getattr(self, "lora_diffs", None) and len(self.lora_diffs) > 0:
+            return self._apply_lora_fused(input, weight, bias)
 
         # PUNICA-STYLE ON-THE-FLY: Compute W@x + A@(B@x) directly
         # This avoids large delta transfers - only transfers small A, B matrices

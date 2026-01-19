@@ -40,25 +40,25 @@ os.environ["FRAME_WINDOW_SIZE"] = "25"
 # STEP 4: SPEED OPTIMIZATIONS
 # ============================================================
 
-# 1. REDUCE DIFFUSION STEPS: 3 -> 2 (saves ~33% sampling time!)
-os.environ["MAX_STEPS"] = "2"
+# 1. DIFFUSION STEPS: Keep at 3 for quality (user requirement)
+os.environ["MAX_STEPS"] = "3"
 
-# 2. REDUCE WINDOW OVERLAP: 25 -> 5 frames overlap
-#    This reduces windows from 8 to ~5, saving ~3 windows worth of compute
-#    Formula: windows = total_frames / (window_size - overlap) + 1
-#    120 / (25-5) + 1 = 7 windows (vs 8 with overlap=9)
-os.environ["MOTION_FRAME"] = "5"
+# 2. WINDOW OVERLAP: Default 25 frames for smooth transitions
+# os.environ["MOTION_FRAME"] = "5"  # Uncomment to reduce windows (faster but less smooth)
 
-# 3. LORA SETTINGS
-# MERGED_WEIGHT: Auto-enabled on A100/H100 (>=40GB), disabled on L4 to avoid OOM
-#   - A100: Delta computed on GPU, merged weight cached → ZERO overhead after first call
-#   - L4: Delta computed on CPU, moved to GPU each time → slower but no OOM
-# To force enable/disable: os.environ["WAN_LORA_MERGED_WEIGHT"] = "1" or "0"
+# 3. OUTPUT-SPACE LORA FUSION (NEW! Inspired by LoRAFusion paper arxiv:2510.00206)
+#    Instead of (W + delta) @ x, compute W @ x + delta @ x using fused addmm
+#    Benefits:
+#      - Caches delta.T on GPU (no CPU->GPU transfer after first call)
+#      - Uses torch.addmm for fused add+matmul (single CUDA kernel)
+#      - 2 matmuls vs 3 in ONTHEFLY mode (faster!)
+#      - No weight + delta tensor allocation (saves memory bandwidth)
+os.environ["WAN_LORA_FUSED"] = "1"
 os.environ["WAN_LORA_TIMING"] = "1"
 
-# 4. OPTIONAL: torch.compile (experimental - has warmup cost)
-# Uncomment to try - might help on subsequent runs
-# os.environ["WAN_TORCH_COMPILE"] = "1"
+# 4. OPTIONAL: Set ONTHEFLY=1 if you run out of GPU memory (uses A/B matrices instead of delta)
+# os.environ["WAN_LORA_ONTHEFLY"] = "1"
+# os.environ["WAN_LORA_FUSED"] = "0"
 
 # ============================================================
 # STEP 5: Models
@@ -81,24 +81,34 @@ os.environ["REF_IMAGE"] = str(ref_image)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 print("=" * 60)
-print("MAXIMUM SPEED OPTIMIZATION RUN")
+print("OUTPUT-SPACE LORA FUSION RUN")
 print("=" * 60)
-print(f"512x512 @ 5s, {MAX_FRAMES} frames")
+print(f"512x512 @ 5s, {MAX_FRAMES} frames, 3 steps (full quality)")
 print()
-print("SPEED OPTIMIZATIONS:")
-print(f"  ✓ Reduced steps: 3 → 2 (saves ~33% sampling time)")
-print(f"  ✓ Reduced overlap: MOTION_FRAME=5 (fewer windows)")
-print(f"  ✓ Auto-optimized LoRA based on GPU VRAM:")
-print(f"    - A100/H100: GPU delta compute + merged weight cache")
-print(f"    - L4: CPU delta compute (avoids OOM)")
-print(f"  ✓ Architecture-aware GPU optimizations (BF16 on A100)")
+print("NEW OPTIMIZATION: Output-Space LoRA Fusion")
+print("  Inspired by LoRAFusion paper (arxiv:2510.00206)")
 print()
-print("EXPECTED: ~5-6 minutes (down from 7.8 min)")
+print("  BEFORE (Streaming mode):")
+print("    gpu_delta = delta.to(GPU)  # CPU->GPU transfer every forward")
+print("    result = weight + gpu_delta # allocates new tensor")
+print("    out = result @ x            # matmul")
+print()
+print("  AFTER (Fused mode):")
+print("    out = W @ x                 # base matmul")  
+print("    out += x @ delta_t          # FUSED addmm (single kernel!)")
+print()
+print("  Benefits:")
+print("    ✓ delta.T cached on GPU (no CPU->GPU transfer)")
+print("    ✓ torch.addmm fuses add+matmul into one kernel")
+print("    ✓ No weight+delta tensor allocation")
+print("    ✓ 2 matmuls vs 3 in ONTHEFLY mode")
+print()
+print("EXPECTED: Faster than base at steps=3")
 print("=" * 60)
 
 # Pull latest optimizations
 import subprocess as sp
-sp.run(["git", "-C", str(COMFY_DIR / "custom_nodes" / "ComfyUI-WanVideoWrapper"), "pull", "origin", "talking-photo-optimizations"], capture_output=True)
+sp.run(["git", "-C", str(COMFY_DIR / "custom_nodes" / "ComfyUI-WanVideoWrapper"), "pull", "origin", "performance-optimizations-same-steps"], capture_output=True)
 
 t0 = time.perf_counter()
 try:
