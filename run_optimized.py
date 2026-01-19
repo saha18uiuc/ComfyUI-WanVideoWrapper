@@ -50,10 +50,10 @@ os.environ["MAX_STEPS"] = "2"
 os.environ["MOTION_FRAME"] = "5"
 
 # 3. LORA SETTINGS
-# NOTE: WAN_LORA_ONTHEFLY=1 uses Punica-style (3 matmuls) - SLOWER but lower memory
-# Default STREAMING mode uses 1 matmul with cached delta - FASTER on high-VRAM GPUs
-# Only set ONTHEFLY=1 if you're running out of memory
-# os.environ["WAN_LORA_ONTHEFLY"] = "1"  # Disabled - slower than default
+# MERGED_WEIGHT: Auto-enabled on A100/H100 (>=40GB), disabled on L4 to avoid OOM
+#   - A100: Delta computed on GPU, merged weight cached → ZERO overhead after first call
+#   - L4: Delta computed on CPU, moved to GPU each time → slower but no OOM
+# To force enable/disable: os.environ["WAN_LORA_MERGED_WEIGHT"] = "1" or "0"
 os.environ["WAN_LORA_TIMING"] = "1"
 
 # 4. OPTIONAL: torch.compile (experimental - has warmup cost)
@@ -88,7 +88,9 @@ print()
 print("SPEED OPTIMIZATIONS:")
 print(f"  ✓ Reduced steps: 3 → 2 (saves ~33% sampling time)")
 print(f"  ✓ Reduced overlap: MOTION_FRAME=5 (fewer windows)")
-print(f"  ✓ Streaming LoRA with cached delta (faster than Punica)")
+print(f"  ✓ Auto-optimized LoRA based on GPU VRAM:")
+print(f"    - A100/H100: GPU delta compute + merged weight cache")
+print(f"    - L4: CPU delta compute (avoids OOM)")
 print(f"  ✓ Architecture-aware GPU optimizations (BF16 on A100)")
 print()
 print("EXPECTED: ~5-6 minutes (down from 7.8 min)")

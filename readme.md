@@ -97,22 +97,24 @@ Summary of Optimizations
 
 ### Smart LoRA Mode Selection
 
-- **Streaming Mode (Default, Fastest)** — Builds merged delta `ΔW = Σ(scale × A @ B)` incrementally and caches it. Forward pass uses single `F.linear(x, W + ΔW)` matmul. **Recommended for high-VRAM GPUs (A100, H100).**
+- **Merged Weight Cache (A100/H100, >=40GB VRAM)** — Computes `W_merged = W + ΔW` once, caches it on GPU. Subsequent forward passes have **ZERO LoRA overhead** - just `F.linear(x, W_merged)`. Delta computed on GPU for maximum speed.
 
-- **On-the-Fly Mode (Lower Memory)** — Computes `W@x + Σ(scale × A @ (B @ x))` directly without materializing delta. Uses 3 matmuls instead of 1, so **slower but uses less peak memory**. Auto-disabled on high-VRAM GPUs unless explicitly requested via `WAN_LORA_ONTHEFLY=1`.
+- **Streaming Mode (L4/Consumer GPUs, <40GB VRAM)** — Computes delta on CPU (avoids OOM), caches it, adds to weight each forward pass. Trades speed for memory safety.
 
-- **A/B GPU Caching** — When using On-the-Fly mode, caches LoRA A and B matrices on GPU with `non_blocking=True` transfers. Achieves 91.7% cache hit rate, reducing CPU→GPU transfers from ~30,000 to ~482.
+- **On-the-Fly Mode (Explicit, OOM fallback)** — Computes `W@x + Σ(scale × A @ (B @ x))` directly without materializing delta. Uses 3 matmuls, slowest but lowest memory. Only enable via `WAN_LORA_ONTHEFLY=1` if other modes OOM.
 
 ```python
-# Streaming Mode (DEFAULT - FASTER):
-# Single matmul with pre-computed delta
-out = F.linear(input, weight + cached_delta, bias)  # 1 matmul
+# Merged Weight Cache (A100 - FASTEST):
+# Delta computed on GPU, merged weight cached
+out = F.linear(input, cached_merged_weight, bias)  # ZERO overhead!
 
-# On-the-Fly Mode (OPTIONAL - LOWER MEMORY):
-# Three matmuls, no delta materialization  
+# Streaming Mode (L4 - BALANCED):
+# Delta computed on CPU, added each forward
+out = F.linear(input, weight + cpu_delta.to(gpu), bias)
+
+# On-the-Fly Mode (FALLBACK - SLOWEST):
 out = F.linear(input, weight, bias)  # matmul 1
-Bx = torch.mm(x_flat, B_flat_t)      # matmul 2
-out += torch.mm(Bx, A_flat.t()) * s  # matmul 3
+out += (B @ x) @ A * scale           # matmuls 2-3
 ```
 
 ### Hot Path Micro-Optimizations
@@ -187,8 +189,8 @@ Environment Variables
 
 | Variable | Default | Description |
 | -------- | ------- | ----------- |
-| `WAN_LORA_ONTHEFLY` | `0` | Punica-style LoRA (lower memory, slower). Only enable if OOM. |
-| `WAN_LORA_STREAMING` | `1` | Streaming delta merge (faster, default). Recommended. |
+| `WAN_LORA_MERGED_WEIGHT` | auto | Cache merged weight on GPU. Auto-enabled on >=40GB VRAM. |
+| `WAN_LORA_ONTHEFLY` | `0` | Punica-style LoRA (3 matmuls). Only enable if OOM. |
 | `WAN_LORA_TIMING` | `0` | Print LoRA timing statistics after generation |
 | `MAX_STEPS` | `3` | Diffusion steps (2 for speed, 3+ for quality) |
 | `MOTION_FRAME` | `25` | Frame overlap between windows (lower = faster) |
