@@ -60,9 +60,10 @@ os.environ["WAN_LORA_TIMING"] = "1"
 # os.environ["WAN_LORA_ONTHEFLY"] = "1"
 # os.environ["WAN_LORA_FUSED"] = "0"
 
-# 5. OPTIONAL: torch.compile for extra kernel fusion (adds ~30s warmup, then faster)
-#    Only enable if running multiple generations - warmup cost is amortized over runs
-# os.environ["WAN_LORA_COMPILE"] = "1"
+# 5. torch.compile: AUTO-ENABLED on compatible systems (PyTorch 2.0+, CUDA)
+#    Adds ~30s warmup on first window, then faster for ALL subsequent windows
+#    Warmup cost is amortized over the generation - worth it for multi-window runs
+#    To disable: os.environ["WAN_LORA_COMPILE"] = "0"
 
 # ============================================================
 # STEP 5: Models
@@ -106,6 +107,11 @@ print("    ✓ delta.T cached on GPU (no CPU->GPU transfer)")
 print("    ✓ torch.addmm fuses add+matmul into one kernel")
 print("    ✓ No weight+delta tensor allocation")
 print("    ✓ 2 matmuls vs 3 in ONTHEFLY mode")
+print()
+print("  + torch.compile (AUTO-ENABLED on PyTorch 2.0+):")
+print("    ✓ Inductor auto-generates optimized CUDA kernels")
+print("    ✓ ~30s warmup on first window, then faster for rest")
+print("    ✓ NO additional memory usage (safe from OOM)")
 print()
 print("EXPECTED: Faster than base at steps=3")
 print("=" * 60)

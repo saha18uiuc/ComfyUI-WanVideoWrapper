@@ -107,10 +107,40 @@ LORA_FUSED = os.environ.get("WAN_LORA_FUSED", "1").strip().lower() in ("1", "tru
 # LORA_COMPILE: Use torch.compile for extra kernel fusion (requires PyTorch 2.0+)
 # This adds ~30s warmup on first run but kernels are cached for subsequent runs
 # The Inductor compiler auto-fuses the linear+addmm into optimized CUDA kernels
-LORA_COMPILE = os.environ.get("WAN_LORA_COMPILE", "0").strip().lower() in ("1", "true", "yes")
+# AUTO-DETECTION: Enabled by default on compatible systems (PyTorch 2.0+, CUDA)
+def _should_auto_enable_compile():
+    """Auto-detect if torch.compile should be enabled."""
+    # Check environment override first
+    env_val = os.environ.get("WAN_LORA_COMPILE", "auto").strip().lower()
+    if env_val in ("1", "true", "yes"):
+        return True
+    if env_val in ("0", "false", "no"):
+        return False
+    
+    # Auto mode: check compatibility
+    try:
+        # Requires PyTorch 2.0+
+        torch_version = tuple(int(x) for x in torch.__version__.split('.')[:2])
+        if torch_version < (2, 0):
+            return False
+        
+        # Requires CUDA
+        if not torch.cuda.is_available():
+            return False
+        
+        # Check if torch.compile is actually available
+        if not hasattr(torch, 'compile'):
+            return False
+        
+        return True
+    except Exception:
+        return False
+
+LORA_COMPILE = _should_auto_enable_compile()
 
 # Global compiled function cache to avoid re-compilation
 _compiled_fused_forward = None
+_compile_warmup_done = False
 
 
 def _fused_lora_addmm_impl(out_flat: torch.Tensor, x_flat: torch.Tensor, delta_t: torch.Tensor) -> torch.Tensor:
@@ -124,7 +154,7 @@ def _fused_lora_addmm_impl(out_flat: torch.Tensor, x_flat: torch.Tensor, delta_t
 
 def _get_compiled_fused_forward():
     """Get or create the compiled fused forward function."""
-    global _compiled_fused_forward
+    global _compiled_fused_forward, _compile_warmup_done
     if _compiled_fused_forward is None and LORA_COMPILE:
         try:
             # Use reduce-overhead mode for minimal warmup
@@ -134,7 +164,9 @@ def _get_compiled_fused_forward():
                 mode="reduce-overhead",
                 fullgraph=True,
             )
-            print("[WanVideo LoRA] torch.compile initialized for fused LoRA")
+            if not _compile_warmup_done:
+                print("[WanVideo LoRA] torch.compile warming up (one-time cost)...")
+                _compile_warmup_done = True
         except Exception as e:
             print(f"[WanVideo LoRA] torch.compile failed, using eager mode: {e}")
             _compiled_fused_forward = _fused_lora_addmm_impl
@@ -142,9 +174,10 @@ def _get_compiled_fused_forward():
 
 if LORA_FUSED:
     if LORA_COMPILE:
-        print(f"[WanVideo LoRA] FUSED+COMPILED mode ENABLED - torch.compile optimized kernels")
+        print(f"[WanVideo LoRA] FUSED+COMPILED mode ENABLED - torch.compile for max speed (auto-detected)")
+        print(f"[WanVideo LoRA]   Note: ~30s warmup on first window, then faster for all subsequent windows")
     else:
-        print(f"[WanVideo LoRA] FUSED mode ENABLED - output-space LoRA fusion (fastest)")
+        print(f"[WanVideo LoRA] FUSED mode ENABLED - output-space LoRA fusion")
 elif LORA_ONTHEFLY:
     print(f"[WanVideo LoRA] ON-THE-FLY mode ENABLED - Punica-style A@(B@x), no delta transfer!")
 elif LORA_STREAMING:
