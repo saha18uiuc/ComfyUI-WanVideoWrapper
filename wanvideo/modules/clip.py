@@ -116,7 +116,7 @@ class SwiGLU(nn.Module):
         if _HAS_FUSED_SILU:
             x = fused_silu_mul(self.fc1(x), self.fc2(x))
         else:
-        x = F.silu(self.fc1(x)) * self.fc2(x)
+            x = F.silu(self.fc1(x)) * self.fc2(x)
         x = self.fc3(x)
         return x
 
