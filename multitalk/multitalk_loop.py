@@ -79,7 +79,7 @@ def multitalk_loop(self, **kwargs):
         motion_frame = int(motion_frame_env)
         log.info(f"[MultiTalk] Using MOTION_FRAME from env: {motion_frame}")
     else:
-    motion_frame = image_embeds.get("motion_frame", 25)
+        motion_frame = image_embeds.get("motion_frame", 25)
     target_w = image_embeds.get("target_w", None)
     target_h = image_embeds.get("target_h", None)
     original_images = cond_image = image_embeds.get("multitalk_start_image", None)
