@@ -84,45 +84,45 @@ MERGE_STATIC_LORA = os.environ.get("WAN_MERGE_STATIC_LORA", "1").strip().lower()
 PIN_LORA_GPU = os.environ.get("WAN_PIN_LORA_GPU", "0").strip().lower() in ("1", "true", "yes")
 
 # =============================================================================
-# LORA MODE SELECTION (Punica/LoRAFusion research-based)
+# LORA MODE SELECTION
 # =============================================================================
 # 
-# DEFAULT: ONTHEFLY mode (Punica-style) - works on ALL GPUs without OOM
+# DEFAULT: STREAMING mode - proven fastest on L4 (~6.4 min vs 7.2 min base)
 # 
-# Why ONTHEFLY is optimal:
-# - Caches SMALL A/B matrices on GPU (rank × features, ~32x smaller than delta)
-# - Computes W@x + A@(B@x) each forward (3 matmuls, but no large transfers)
-# - Works on L4 (22GB) and A100 (80GB) equally well
+# How STREAMING works:
+# 1. First forward: compute delta = sum(A@B * strength) on CPU, cache it
+# 2. Subsequent forwards: transfer cached delta to GPU, compute (W+delta)@x
 # 
-# Alternative modes (for special cases):
-# - STREAMING: Caches full delta on CPU, transfers each forward (slower)
-# - LAZY: No caching at all (slowest, use only if everything else OOMs)
+# This is FASTER than alternatives because:
+# - Only ONE matmul per forward (vs 2-3 in other modes)
+# - Simple addition (weight + delta) is cheap
+# - No expensive transpose/contiguous operations
+# 
+# Other modes (NOT recommended - tested and slower or OOM):
+# - ONTHEFLY: 3 matmuls per forward - no speedup at steps=3
+# - PIPELINED: Extra transpose+contiguous causes 16ms overhead (regression!)
+# - FUSED: Caches delta on GPU - OOM on L4
 # =============================================================================
 
-# LORA_ONTHEFLY: Punica-style - compute W@x + A@(B@x) directly (DEFAULT!)
-# Caches small A,B matrices on GPU (32x smaller than delta)
-# Research basis: Punica paper (arxiv:2310.18547), S-LoRA, LoRAFusion
-LORA_ONTHEFLY = os.environ.get("WAN_LORA_ONTHEFLY", "1").strip().lower() in ("1", "true", "yes")
+# LORA_STREAMING: DEFAULT - cache delta on CPU, transfer each forward
+# Proven fastest: ~6.4 min on L4 (vs 7.2 min base = 11% speedup)
+LORA_STREAMING = os.environ.get("WAN_LORA_STREAMING", "1").strip().lower() in ("1", "true", "yes")
 
-# LORA_STREAMING: Fallback - caches delta on CPU, transfers each forward
-# Use if ONTHEFLY somehow fails (shouldn't happen)
-LORA_STREAMING = os.environ.get("WAN_LORA_STREAMING", "0").strip().lower() in ("1", "true", "yes")
+# LORA_ONTHEFLY: Punica-style W@x + A@(B@x) - tested, no speedup at steps=3
+LORA_ONTHEFLY = os.environ.get("WAN_LORA_ONTHEFLY", "0").strip().lower() in ("1", "true", "yes")
 
-# LORA_LAZY: No caching - compute everything on-demand (slowest)
+# LORA_LAZY: No caching - slowest, only if everything else OOMs
 LORA_LAZY = os.environ.get("WAN_LORA_LAZY", "0").strip().lower() in ("1", "true", "yes")
 
-# LORA_PREMERGE: Legacy - don't use (OOM risk)
+# LORA_PREMERGE: Legacy - OOM risk
 LORA_PREMERGE = os.environ.get("WAN_LORA_PREMERGE", "0").strip().lower() in ("1", "true", "yes")
 
-# LORA_FUSED: DISABLED - causes OOM on L4 by caching full delta.T on GPU
-# Keeping the flag for backwards compatibility but not recommended
+# LORA_FUSED: OOM on L4 - don't use
 LORA_FUSED = os.environ.get("WAN_LORA_FUSED", "0").strip().lower() in ("1", "true", "yes")
 
-# LORA_PIPELINED: NEW! Overlap delta transfer with W@x computation using CUDA streams
-# Instead of: transfer delta → compute (W+delta)@x (serial)
-# Do: transfer delta (stream 2) || compute W@x (stream 1) → add delta@x
-# This hides the CPU→GPU transfer latency behind the W@x computation
-LORA_PIPELINED = os.environ.get("WAN_LORA_PIPELINED", "1").strip().lower() in ("1", "true", "yes")
+# LORA_PIPELINED: DISABLED - causes regression (16ms/hit due to transpose+contiguous overhead)
+# The overhead of delta.t().contiguous() every forward outweighs any transfer overlap benefit
+LORA_PIPELINED = os.environ.get("WAN_LORA_PIPELINED", "0").strip().lower() in ("1", "true", "yes")
 
 # Global compiled function cache to avoid re-compilation
 _compiled_fused_forward = None
@@ -158,16 +158,16 @@ def _get_compiled_fused_forward():
             _compiled_fused_forward = _fused_lora_addmm_impl
     return _compiled_fused_forward if _compiled_fused_forward else _fused_lora_addmm_impl
 
-if LORA_PIPELINED:
-    print(f"[WanVideo LoRA] PIPELINED mode (CUDA stream overlap)")
-    print(f"[WanVideo LoRA]   Overlaps delta transfer with W@x computation")
-    print(f"[WanVideo LoRA]   Hides CPU→GPU latency behind matmul - works on ALL GPUs")
+if LORA_STREAMING:
+    print(f"[WanVideo LoRA] STREAMING mode (proven fastest)")
+    print(f"[WanVideo LoRA]   Cache delta on CPU, transfer each forward")
+    print(f"[WanVideo LoRA]   ~6.4 min on L4 (11% faster than 7.2 min base)")
+elif LORA_PIPELINED:
+    print(f"[WanVideo LoRA] PIPELINED mode - WARNING: causes regression, use STREAMING")
 elif LORA_ONTHEFLY:
-    print(f"[WanVideo LoRA] PUNICA-STYLE mode (Punica paper arxiv:2310.18547)")
+    print(f"[WanVideo LoRA] PUNICA-STYLE mode - no speedup at steps=3")
 elif LORA_FUSED:
-    print(f"[WanVideo LoRA] FUSED mode - WARNING: may OOM on <40GB GPUs")
-elif LORA_STREAMING:
-    print(f"[WanVideo LoRA] STREAMING mode - delta cached on CPU")
+    print(f"[WanVideo LoRA] FUSED mode - WARNING: OOMs on <40GB GPUs")
 elif LORA_LAZY:
     print(f"[WanVideo LoRA] LAZY mode - no caching (slowest)")
 elif LORA_PREMERGE:
@@ -1286,19 +1286,18 @@ class CustomLinear(nn.Linear):
             else:
                 input = input * self.scale_weight
 
-        # PIPELINED mode (DEFAULT): Overlap delta transfer with W@x computation
-        # Uses CUDA streams to hide CPU→GPU latency - works on ALL GPUs without OOM
+        # STREAMING mode (DEFAULT, FASTEST): Cache delta on CPU, transfer each forward
+        # Uses standard path: _get_weight_with_lora -> _apply_lora_streaming
+        # This falls through to the standard path below
+        
+        # Alternative modes (NOT recommended - tested slower or OOM):
         if LORA_PIPELINED and getattr(self, "lora_diffs", None) and len(self.lora_diffs) > 0:
-            if input.device.type == 'cuda':  # Only use pipelining on GPU
+            if input.device.type == 'cuda':
                 return self._apply_lora_pipelined(input, weight, bias)
 
-        # FUSED mode: Output-space LoRA fusion (for high-VRAM GPUs only)
-        # Caches delta.T on GPU - WARNING: OOMs on <40GB VRAM
         if LORA_FUSED and getattr(self, "lora_diffs", None) and len(self.lora_diffs) > 0:
             return self._apply_lora_fused(input, weight, bias)
 
-        # PUNICA-STYLE ON-THE-FLY: Compute W@x + A@(B@x) directly
-        # This avoids large delta transfers - only transfers small A, B matrices
         if LORA_ONTHEFLY and getattr(self, "lora_diffs", None) and len(self.lora_diffs) > 0:
             return self._apply_lora_onthefly(input, weight, bias)
 
