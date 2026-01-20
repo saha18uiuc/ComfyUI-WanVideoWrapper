@@ -1582,7 +1582,7 @@ class WanVideoSampler:
                     scheduler_graph_flipped.release()
                 scheduler_graph_runner = None
                 scheduler_graph_flipped = None
-        
+
         def disable_graphs(reason):
             """Disable ALL graphs (transformer + scheduler)."""
             nonlocal graph_state, graph_runners, scheduler_graph_runner, scheduler_graph_flipped, scheduler_graph_enabled

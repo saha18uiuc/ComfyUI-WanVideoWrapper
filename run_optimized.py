@@ -46,17 +46,18 @@ os.environ["MAX_STEPS"] = "3"
 # 2. WINDOW OVERLAP: Default 25 frames for smooth transitions
 # os.environ["MOTION_FRAME"] = "5"  # Uncomment to reduce windows (faster but less smooth)
 
-# 3. VRAM-AWARE LoRA OPTIMIZATION (auto-detects best mode)
-#    - A100 (>=40GB): FUSED mode + torch.compile (caches delta.T on GPU)
-#    - L4 (<40GB): STREAMING mode (caches delta on CPU to prevent OOM)
-#    Both modes are optimized for their respective hardware!
+# 3. PIPELINED LoRA MODE (DEFAULT - works on ALL GPUs)
+#    Uses CUDA stream parallelism to overlap:
+#      - Stream A: compute W@x (base linear)
+#      - Stream B: transfer delta CPU→GPU (async)
+#    Then adds delta@x to output using fused addmm
+#    Result: Hides transfer latency, no OOM risk, works on L4 and A100!
 os.environ["WAN_LORA_TIMING"] = "1"
-# Note: FUSED/STREAMING/COMPILE are auto-detected based on VRAM - no need to set manually
+# PIPELINED is ON by default (WAN_LORA_PIPELINED=1)
 
 # 4. MANUAL OVERRIDE (only if needed):
-# Force FUSED mode (may OOM on L4): os.environ["WAN_LORA_FUSED"] = "1"
-# Force STREAMING mode: os.environ["WAN_LORA_FUSED"] = "0"
-# Force torch.compile: os.environ["WAN_LORA_COMPILE"] = "1"
+# Disable pipelining: os.environ["WAN_LORA_PIPELINED"] = "0"
+# Force streaming (serial): os.environ["WAN_LORA_STREAMING"] = "1"
 
 # ============================================================
 # STEP 5: Models
@@ -79,24 +80,26 @@ os.environ["REF_IMAGE"] = str(ref_image)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 print("=" * 60)
-print("VRAM-AWARE OPTIMIZED RUN")
+print("PIPELINED LoRA OPTIMIZATION")
 print("=" * 60)
 print(f"512x512 @ 5s, {MAX_FRAMES} frames, 3 steps (full quality)")
 print()
-print("VRAM-AWARE LoRA Optimization:")
-print("  Auto-detects GPU VRAM and chooses best mode:")
+print("CUDA STREAM PIPELINING (works on ALL GPUs):")
+print("  Traditional approach (SERIAL):")
+print("    1. Transfer delta CPU→GPU (blocks)")
+print("    2. Compute (W+delta)@x")
+print("    Total = transfer_time + compute_time")
 print()
-print("  A100/H100 (>=40GB VRAM):")
-print("    → FUSED mode: delta.T cached on GPU")
-print("    → torch.compile: auto-generates optimized kernels")
-print("    → Maximum speed, zero CPU→GPU transfers")
+print("  PIPELINED approach (THIS RUN):")
+print("    1. Transfer delta in Stream B (async)")
+print("    2. Compute W@x in Stream A (OVERLAPPED!)")
+print("    3. Synchronize, add delta@x")
+print("    Total = max(transfer, Wx) + delta_x")
 print()
-print("  L4/RTX (< 40GB VRAM):")
-print("    → STREAMING mode: delta cached on CPU")
-print("    → Prevents OOM while still being fast")
-print("    → Safe for 22GB GPUs")
-print()
-print("EXPECTED: Optimized for your GPU automatically!")
+print("  Benefits:")
+print("    → Hides CPU→GPU transfer behind computation")
+print("    → No permanent GPU cache (no OOM risk)")
+print("    → Works on L4 (22GB) AND A100 (80GB)")
 print("=" * 60)
 
 # Pull latest optimizations

@@ -343,8 +343,8 @@ class WanRMSNorm(nn.Module):
             elif _HAS_FUSED_RMSNORM:
                 output[:, start_idx:end_idx, :] = F.rms_norm(chunk, (self.dim,), self.weight, self.eps)
             else:
-                norm_factor = torch.rsqrt(chunk.pow(2).mean(dim=-1, keepdim=True) + self.eps)
-                output[:, start_idx:end_idx, :] = chunk * norm_factor.to(chunk.dtype) * self.weight
+            norm_factor = torch.rsqrt(chunk.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+            output[:, start_idx:end_idx, :] = chunk * norm_factor.to(chunk.dtype) * self.weight
 
             start_idx = end_idx
             
