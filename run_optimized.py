@@ -60,6 +60,10 @@ os.environ["WAN_LORA_TIMING"] = "1"
 # os.environ["WAN_LORA_ONTHEFLY"] = "1"
 # os.environ["WAN_LORA_FUSED"] = "0"
 
+# 5. OPTIONAL: torch.compile for extra kernel fusion (adds ~30s warmup, then faster)
+#    Only enable if running multiple generations - warmup cost is amortized over runs
+# os.environ["WAN_LORA_COMPILE"] = "1"
+
 # ============================================================
 # STEP 5: Models
 # ============================================================

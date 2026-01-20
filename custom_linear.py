@@ -104,8 +104,47 @@ LORA_ONTHEFLY = os.environ.get("WAN_LORA_ONTHEFLY", "0").strip().lower() in ("1"
 # This is different from ONTHEFLY which uses A/B matrices - here we use pre-computed delta
 LORA_FUSED = os.environ.get("WAN_LORA_FUSED", "1").strip().lower() in ("1", "true", "yes")
 
+# LORA_COMPILE: Use torch.compile for extra kernel fusion (requires PyTorch 2.0+)
+# This adds ~30s warmup on first run but kernels are cached for subsequent runs
+# The Inductor compiler auto-fuses the linear+addmm into optimized CUDA kernels
+LORA_COMPILE = os.environ.get("WAN_LORA_COMPILE", "0").strip().lower() in ("1", "true", "yes")
+
+# Global compiled function cache to avoid re-compilation
+_compiled_fused_forward = None
+
+
+def _fused_lora_addmm_impl(out_flat: torch.Tensor, x_flat: torch.Tensor, delta_t: torch.Tensor) -> torch.Tensor:
+    """
+    Core fused LoRA computation: out += x @ delta.T
+    This function is designed to be compiled by torch.compile.
+    """
+    # In-place addmm: out = 1.0*out + 1.0*(x @ delta_t)
+    return torch.addmm(out_flat, x_flat, delta_t, beta=1.0, alpha=1.0, out=out_flat)
+
+
+def _get_compiled_fused_forward():
+    """Get or create the compiled fused forward function."""
+    global _compiled_fused_forward
+    if _compiled_fused_forward is None and LORA_COMPILE:
+        try:
+            # Use reduce-overhead mode for minimal warmup
+            # fullgraph=True forces full compilation (faster after warmup)
+            _compiled_fused_forward = torch.compile(
+                _fused_lora_addmm_impl,
+                mode="reduce-overhead",
+                fullgraph=True,
+            )
+            print("[WanVideo LoRA] torch.compile initialized for fused LoRA")
+        except Exception as e:
+            print(f"[WanVideo LoRA] torch.compile failed, using eager mode: {e}")
+            _compiled_fused_forward = _fused_lora_addmm_impl
+    return _compiled_fused_forward if _compiled_fused_forward else _fused_lora_addmm_impl
+
 if LORA_FUSED:
-    print(f"[WanVideo LoRA] FUSED mode ENABLED - output-space LoRA fusion (fastest)")
+    if LORA_COMPILE:
+        print(f"[WanVideo LoRA] FUSED+COMPILED mode ENABLED - torch.compile optimized kernels")
+    else:
+        print(f"[WanVideo LoRA] FUSED mode ENABLED - output-space LoRA fusion (fastest)")
 elif LORA_ONTHEFLY:
     print(f"[WanVideo LoRA] ON-THE-FLY mode ENABLED - Punica-style A@(B@x), no delta transfer!")
 elif LORA_STREAMING:
@@ -1111,15 +1150,25 @@ class CustomLinear(nn.Linear):
         # Compute base output: W @ x
         out = F.linear(input, weight, bias)
         
-        # Reshape for matmul
+        # Reshape for matmul - ensure contiguous for optimal CUDA performance
         orig_shape = out.shape
         out_flat = out.view(-1, orig_shape[-1])  # (batch*seq, out_features)
         x_flat = input.view(-1, input.shape[-1])  # (batch*seq, in_features)
         
+        # Ensure contiguous memory layout for addmm (avoids hidden copies)
+        if not out_flat.is_contiguous():
+            out_flat = out_flat.contiguous()
+        if not x_flat.is_contiguous():
+            x_flat = x_flat.contiguous()
+        
         # FUSED add + matmul: out += x @ delta.T
         # torch.addmm(input, mat1, mat2, beta=1, alpha=1, out=None)
         # computes: beta*input + alpha*(mat1 @ mat2)
-        torch.addmm(out_flat, x_flat, delta_t, beta=1.0, alpha=1.0, out=out_flat)
+        if LORA_COMPILE:
+            # Use compiled kernel for better fusion
+            _get_compiled_fused_forward()(out_flat, x_flat, delta_t)
+        else:
+            torch.addmm(out_flat, x_flat, delta_t, beta=1.0, alpha=1.0, out=out_flat)
         
         if _LORA_TIMING_ENABLED:
             _lora_timing_stats["gpu_additions"] = _lora_timing_stats.get("gpu_additions", 0) + 1
