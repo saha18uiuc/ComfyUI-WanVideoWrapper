@@ -46,24 +46,17 @@ os.environ["MAX_STEPS"] = "3"
 # 2. WINDOW OVERLAP: Default 25 frames for smooth transitions
 # os.environ["MOTION_FRAME"] = "5"  # Uncomment to reduce windows (faster but less smooth)
 
-# 3. OUTPUT-SPACE LORA FUSION (NEW! Inspired by LoRAFusion paper arxiv:2510.00206)
-#    Instead of (W + delta) @ x, compute W @ x + delta @ x using fused addmm
-#    Benefits:
-#      - Caches delta.T on GPU (no CPU->GPU transfer after first call)
-#      - Uses torch.addmm for fused add+matmul (single CUDA kernel)
-#      - 2 matmuls vs 3 in ONTHEFLY mode (faster!)
-#      - No weight + delta tensor allocation (saves memory bandwidth)
-os.environ["WAN_LORA_FUSED"] = "1"
+# 3. VRAM-AWARE LoRA OPTIMIZATION (auto-detects best mode)
+#    - A100 (>=40GB): FUSED mode + torch.compile (caches delta.T on GPU)
+#    - L4 (<40GB): STREAMING mode (caches delta on CPU to prevent OOM)
+#    Both modes are optimized for their respective hardware!
 os.environ["WAN_LORA_TIMING"] = "1"
+# Note: FUSED/STREAMING/COMPILE are auto-detected based on VRAM - no need to set manually
 
-# 4. OPTIONAL: Set ONTHEFLY=1 if you run out of GPU memory (uses A/B matrices instead of delta)
-# os.environ["WAN_LORA_ONTHEFLY"] = "1"
-# os.environ["WAN_LORA_FUSED"] = "0"
-
-# 5. torch.compile: AUTO-ENABLED on compatible systems (PyTorch 2.0+, CUDA)
-#    Adds ~30s warmup on first window, then faster for ALL subsequent windows
-#    Warmup cost is amortized over the generation - worth it for multi-window runs
-#    To disable: os.environ["WAN_LORA_COMPILE"] = "0"
+# 4. MANUAL OVERRIDE (only if needed):
+# Force FUSED mode (may OOM on L4): os.environ["WAN_LORA_FUSED"] = "1"
+# Force STREAMING mode: os.environ["WAN_LORA_FUSED"] = "0"
+# Force torch.compile: os.environ["WAN_LORA_COMPILE"] = "1"
 
 # ============================================================
 # STEP 5: Models
@@ -86,34 +79,24 @@ os.environ["REF_IMAGE"] = str(ref_image)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 print("=" * 60)
-print("OUTPUT-SPACE LORA FUSION RUN")
+print("VRAM-AWARE OPTIMIZED RUN")
 print("=" * 60)
 print(f"512x512 @ 5s, {MAX_FRAMES} frames, 3 steps (full quality)")
 print()
-print("NEW OPTIMIZATION: Output-Space LoRA Fusion")
-print("  Inspired by LoRAFusion paper (arxiv:2510.00206)")
+print("VRAM-AWARE LoRA Optimization:")
+print("  Auto-detects GPU VRAM and chooses best mode:")
 print()
-print("  BEFORE (Streaming mode):")
-print("    gpu_delta = delta.to(GPU)  # CPU->GPU transfer every forward")
-print("    result = weight + gpu_delta # allocates new tensor")
-print("    out = result @ x            # matmul")
+print("  A100/H100 (>=40GB VRAM):")
+print("    → FUSED mode: delta.T cached on GPU")
+print("    → torch.compile: auto-generates optimized kernels")
+print("    → Maximum speed, zero CPU→GPU transfers")
 print()
-print("  AFTER (Fused mode):")
-print("    out = W @ x                 # base matmul")  
-print("    out += x @ delta_t          # FUSED addmm (single kernel!)")
+print("  L4/RTX (< 40GB VRAM):")
+print("    → STREAMING mode: delta cached on CPU")
+print("    → Prevents OOM while still being fast")
+print("    → Safe for 22GB GPUs")
 print()
-print("  Benefits:")
-print("    ✓ delta.T cached on GPU (no CPU->GPU transfer)")
-print("    ✓ torch.addmm fuses add+matmul into one kernel")
-print("    ✓ No weight+delta tensor allocation")
-print("    ✓ 2 matmuls vs 3 in ONTHEFLY mode")
-print()
-print("  + torch.compile (AUTO-ENABLED on PyTorch 2.0+):")
-print("    ✓ Inductor auto-generates optimized CUDA kernels")
-print("    ✓ ~30s warmup on first window, then faster for rest")
-print("    ✓ NO additional memory usage (safe from OOM)")
-print()
-print("EXPECTED: Faster than base at steps=3")
+print("EXPECTED: Optimized for your GPU automatically!")
 print("=" * 60)
 
 # Pull latest optimizations

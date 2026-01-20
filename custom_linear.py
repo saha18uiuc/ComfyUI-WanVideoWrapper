@@ -102,12 +102,42 @@ LORA_ONTHEFLY = os.environ.get("WAN_LORA_ONTHEFLY", "0").strip().lower() in ("1"
 # compute W @ x + delta @ x where delta @ x uses the CACHED delta on GPU
 # Key insight: We cache delta.T (transposed) on GPU once, then use torch.addmm for fusion
 # This is different from ONTHEFLY which uses A/B matrices - here we use pre-computed delta
-LORA_FUSED = os.environ.get("WAN_LORA_FUSED", "1").strip().lower() in ("1", "true", "yes")
+# 
+# VRAM-AWARE: Auto-disabled on low-VRAM GPUs (<40GB) to prevent OOM
+# On low-VRAM GPUs, falls back to STREAMING mode (delta cached on CPU)
+def _should_enable_fused():
+    """Auto-detect if FUSED mode should be enabled based on VRAM."""
+    env_val = os.environ.get("WAN_LORA_FUSED", "auto").strip().lower()
+    if env_val in ("1", "true", "yes"):
+        return True  # Force enable
+    if env_val in ("0", "false", "no"):
+        return False  # Force disable
+    
+    # Auto mode: check VRAM
+    try:
+        if not torch.cuda.is_available():
+            return False
+        
+        # Get total VRAM in GB
+        total_vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        
+        # FUSED mode caches delta.T on GPU for ALL LoRA patches
+        # This uses ~2-4GB extra on top of base model
+        # Only safe on high-VRAM GPUs (>=40GB like A100)
+        # On L4 (22GB), this causes OOM
+        if total_vram_gb >= 40:
+            return True
+        else:
+            return False  # Fall back to STREAMING mode
+    except Exception:
+        return False
+
+LORA_FUSED = _should_enable_fused()
 
 # LORA_COMPILE: Use torch.compile for extra kernel fusion (requires PyTorch 2.0+)
 # This adds ~30s warmup on first run but kernels are cached for subsequent runs
 # The Inductor compiler auto-fuses the linear+addmm into optimized CUDA kernels
-# AUTO-DETECTION: Enabled by default on compatible systems (PyTorch 2.0+, CUDA)
+# AUTO-DETECTION: Only enabled on high-VRAM GPUs (>=40GB) to avoid memory pressure
 def _should_auto_enable_compile():
     """Auto-detect if torch.compile should be enabled."""
     # Check environment override first
@@ -117,7 +147,7 @@ def _should_auto_enable_compile():
     if env_val in ("0", "false", "no"):
         return False
     
-    # Auto mode: check compatibility
+    # Auto mode: check compatibility AND VRAM
     try:
         # Requires PyTorch 2.0+
         torch_version = tuple(int(x) for x in torch.__version__.split('.')[:2])
@@ -130,6 +160,12 @@ def _should_auto_enable_compile():
         
         # Check if torch.compile is actually available
         if not hasattr(torch, 'compile'):
+            return False
+        
+        # Only enable on high-VRAM GPUs (>=40GB)
+        # torch.compile can add memory pressure during compilation
+        total_vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        if total_vram_gb < 40:
             return False
         
         return True
@@ -174,14 +210,26 @@ def _get_compiled_fused_forward():
 
 if LORA_FUSED:
     if LORA_COMPILE:
-        print(f"[WanVideo LoRA] FUSED+COMPILED mode ENABLED - torch.compile for max speed (auto-detected)")
-        print(f"[WanVideo LoRA]   Note: ~30s warmup on first window, then faster for all subsequent windows")
+        print(f"[WanVideo LoRA] FUSED+COMPILED mode (high-VRAM GPU detected, >=40GB)")
+        print(f"[WanVideo LoRA]   ~30s warmup on first window, then faster for all subsequent")
     else:
-        print(f"[WanVideo LoRA] FUSED mode ENABLED - output-space LoRA fusion")
+        print(f"[WanVideo LoRA] FUSED mode ENABLED - output-space LoRA fusion (high-VRAM)")
 elif LORA_ONTHEFLY:
     print(f"[WanVideo LoRA] ON-THE-FLY mode ENABLED - Punica-style A@(B@x), no delta transfer!")
 elif LORA_STREAMING:
-    print(f"[WanVideo LoRA] Streaming merge ENABLED - incremental cache build")
+    # Check if this is because of low VRAM
+    try:
+        if torch.cuda.is_available():
+            total_vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+            if total_vram_gb < 40:
+                print(f"[WanVideo LoRA] STREAMING mode (low-VRAM GPU detected, <40GB)")
+                print(f"[WanVideo LoRA]   Delta cached on CPU to prevent OOM - still fast!")
+            else:
+                print(f"[WanVideo LoRA] Streaming merge ENABLED - incremental cache build")
+        else:
+            print(f"[WanVideo LoRA] Streaming merge ENABLED - incremental cache build")
+    except Exception:
+        print(f"[WanVideo LoRA] Streaming merge ENABLED - incremental cache build")
 elif LORA_LAZY:
     print(f"[WanVideo LoRA] Lazy mode ENABLED - compute on-demand")
 elif LORA_PREMERGE:
