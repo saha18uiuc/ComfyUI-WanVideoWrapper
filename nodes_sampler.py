@@ -378,16 +378,7 @@ class WanVideoSampler:
             set_lora_params(transformer, patcher.patches)
             static_threshold = transformer_options.get("static_lora_merge_threshold", 8)
             auto_merge_enabled = transformer_options.get("auto_static_lora_merge", True)
-            
-            # WAN_LORA_PREMERGE=1: Force merge ALL LoRA into weights at load time
-            # This eliminates ALL runtime LoRA overhead (0s vs 249s with STREAMING)
-            # Requires enough VRAM to compute delta per layer (~50MB temp per layer)
-            # After merge: inference is EXACTLY like base model - no LoRA overhead!
-            env_force_premerge = os.environ.get("WAN_LORA_PREMERGE", "").strip().lower() in ("1", "true", "yes")
-            if env_force_premerge:
-                static_threshold = 1  # Merge everything, even single-LoRA layers
-                log.info(f"[WAN_LORA_PREMERGE] Force-merging ALL LoRA into weights (min_patches=1)")
-            elif auto_merge_enabled and static_threshold > 2 and total_lora_patches >= 256:
+            if auto_merge_enabled and static_threshold > 2 and total_lora_patches >= 256:
                 if total_lora_patches >= 1024:
                     adaptive_threshold = 2
                 elif total_lora_patches >= 512:
