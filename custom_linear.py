@@ -492,8 +492,6 @@ class CustomLinear(nn.Linear):
         self._fused_delta_t = None
         self._fused_delta_device = None
         self._fused_delta_dtype = None
-        # Clear GPU buffer for pinned memory optimization
-        self._gpu_delta_buffer = None
 
     def set_lora_diffs(self, lora_diffs, device=torch.device("cpu")):
         self._reset_lora_cache()
@@ -810,21 +808,10 @@ class CustomLinear(nn.Linear):
             cached_delta = self._lora_cached_deltas[0]
             
             if weight.device.type == 'cuda':
-                # OPTIMIZATION: Reuse GPU buffer to avoid repeated allocations
-                # Allocation overhead can be 5-10ms per call!
-                gpu_buf = getattr(self, '_gpu_delta_buffer', None)
-                if (gpu_buf is None or 
-                    gpu_buf.shape != cached_delta.shape or 
-                    gpu_buf.device != weight.device or
-                    gpu_buf.dtype != weight.dtype):
-                    # Allocate new buffer (only happens once per shape/device/dtype)
-                    self._gpu_delta_buffer = torch.empty_like(cached_delta, device=weight.device, dtype=weight.dtype)
-                    gpu_buf = self._gpu_delta_buffer
-                
-                # Fast async copy into pre-allocated buffer (pinned memory + buffer reuse = fast!)
-                gpu_buf.copy_(cached_delta, non_blocking=True)
-                result = weight + gpu_buf
-                # DON'T delete gpu_buf - we reuse it!
+                # Move delta to GPU, add, DON'T keep (to avoid OOM)
+                gpu_delta = cached_delta.to(weight.device, weight.dtype, non_blocking=True)
+                result = weight + gpu_delta
+                del gpu_delta
                 if _LORA_TIMING_ENABLED:
                     _lora_timing_stats["gpu_additions"] = _lora_timing_stats.get("gpu_additions", 0) + 1
             else:
@@ -880,19 +867,7 @@ class CustomLinear(nn.Linear):
         # Convert to weight dtype and KEEP ON CPU for storage
         # We'll move to GPU only when needed (in the cache hit path above)
         merged_delta = merged_delta.to(weight.dtype)
-        
-        # OPTIMIZATION: Use pinned memory for 3-5× faster CPU→GPU transfer
-        # Pinned memory enables true async DMA transfer without CPU involvement
-        # This can reduce 25ms/transfer to ~5-8ms/transfer
-        try:
-            pinned_delta = torch.empty_like(merged_delta, pin_memory=True)
-            pinned_delta.copy_(merged_delta)
-            self._lora_cached_deltas = [pinned_delta]  # Stored in pinned CPU memory!
-            del merged_delta
-        except RuntimeError:
-            # Pinned memory allocation failed (too much memory), fall back to regular
-            self._lora_cached_deltas = [merged_delta]
-        
+        self._lora_cached_deltas = [merged_delta]  # Stored on CPU!
         self._lora_cache_device = torch.device('cpu')  # Mark as on CPU
         self._lora_cache_dtype = weight.dtype
         
