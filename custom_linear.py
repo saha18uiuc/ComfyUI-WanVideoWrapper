@@ -124,6 +124,21 @@ LORA_FUSED = os.environ.get("WAN_LORA_FUSED", "0").strip().lower() in ("1", "tru
 # The overhead of delta.t().contiguous() every forward outweighs any transfer overlap benefit
 LORA_PIPELINED = os.environ.get("WAN_LORA_PIPELINED", "0").strip().lower() in ("1", "true", "yes")
 
+# =============================================================================
+# LORA_TRITON: NEW! Use Triton grouped kernel for LoRA (RESEARCH-BACKED)
+# =============================================================================
+# Based on Punica/S-LoRA papers: compute out = W@x + scale*(A@(B@x)) directly
+# 
+# Key advantages over STREAMING:
+# - Keeps small A, B matrices on GPU (~1MB each vs 50MB delta)
+# - NO CPU→GPU transfer per forward (eliminates 25ms/hit overhead!)
+# - Uses fused Triton kernel for efficient A@(B@x) computation
+# 
+# Memory: 1262 layers × ~2MB = ~2.5GB (fits on L4's 22GB)
+# Expected: Eliminates 249s of transfer overhead → potential 3+ min savings
+# =============================================================================
+LORA_TRITON = os.environ.get("WAN_LORA_TRITON", "0").strip().lower() in ("1", "true", "yes")
+
 # Global compiled function cache to avoid re-compilation
 _compiled_fused_forward = None
 _compile_warmup_done = False
@@ -158,7 +173,17 @@ def _get_compiled_fused_forward():
             _compiled_fused_forward = _fused_lora_addmm_impl
     return _compiled_fused_forward if _compiled_fused_forward else _fused_lora_addmm_impl
 
-if LORA_STREAMING:
+_triton_available = grouped_lora_available()
+if LORA_TRITON:
+    if _triton_available:
+        print(f"[WanVideo LoRA] TRITON mode (NEW! Research-backed)")
+        print(f"[WanVideo LoRA]   Uses Punica-style fused kernel: out = W@x + A@(B@x)")
+        print(f"[WanVideo LoRA]   NO CPU→GPU transfer! A,B stay on GPU (~2.5GB total)")
+        print(f"[WanVideo LoRA]   Expected: Eliminates 249s transfer overhead")
+    else:
+        print(f"[WanVideo LoRA] TRITON mode requested but Triton not available!")
+        print(f"[WanVideo LoRA]   Will fall back to STREAMING mode at runtime")
+elif LORA_STREAMING:
     print(f"[WanVideo LoRA] STREAMING mode (proven fastest)")
     print(f"[WanVideo LoRA]   Cache delta on CPU, transfer each forward")
     print(f"[WanVideo LoRA]   ~6.4 min on L4 (11% faster than 7.2 min base)")
@@ -1286,7 +1311,29 @@ class CustomLinear(nn.Linear):
             else:
                 input = input * self.scale_weight
 
-        # STREAMING mode (DEFAULT, FASTEST): Cache delta on CPU, transfer each forward
+        # =============================================================================
+        # LORA_TRITON: NEW RESEARCH-BACKED MODE - Use Triton fused kernel
+        # Computes: out = W@x + scale*(A@(B@x)) without CPU→GPU transfer!
+        # =============================================================================
+        if LORA_TRITON and grouped_lora_available() and getattr(self, "lora_diffs", None) and len(self.lora_diffs) > 0:
+            if weight.is_cuda and getattr(self, "_all_lora_are_tuples", None):
+                # Force enable grouped LoRA for Triton mode
+                self.grouped_lora_enabled = True
+                try:
+                    grouped_delta = self._compute_grouped_lora(input, weight)
+                    if grouped_delta is not None:
+                        out = self._linear_forward_impl(input, weight, bias)
+                        if _LORA_TIMING_ENABLED:
+                            _lora_timing_stats['ab_cache_hits'] = _lora_timing_stats.get('ab_cache_hits', 0) + 1
+                        return out + grouped_delta.to(out.dtype)
+                except Exception as e:
+                    # Triton kernel failed, fall through to STREAMING
+                    if not hasattr(self, '_triton_fail_logged'):
+                        print(f"[WanVideo LoRA] Triton kernel failed: {e}, falling back to STREAMING")
+                        self._triton_fail_logged = True
+                # If grouped kernel fails, fall through to STREAMING
+        
+        # STREAMING mode (DEFAULT): Cache delta on CPU, transfer each forward
         # Uses standard path: _get_weight_with_lora -> _apply_lora_streaming
         # This falls through to the standard path below
         
