@@ -1220,8 +1220,31 @@ class WanVideoSampler:
         else:
             transformer.slg_blocks = None
 
-        # Setup radial attention
+        # Setup radial attention (1.9× speedup on Wan2.1 - MIT research)
+        # Can be enabled via WAN_ATTENTION_MODE=radial_sage_attention
         if transformer.attention_mode == "radial_sage_attention":
+            # Allow env var override for radial attention parameters
+            env_decay = os.environ.get("WAN_RADIAL_DECAY_FACTOR", "")
+            env_block_size = os.environ.get("WAN_RADIAL_BLOCK_SIZE", "")
+            env_dense_blocks = os.environ.get("WAN_RADIAL_DENSE_BLOCKS", "")
+            env_dense_timesteps = os.environ.get("WAN_RADIAL_DENSE_TIMESTEPS", "")
+            
+            if env_decay:
+                transformer_options["decay_factor"] = float(env_decay)
+            if env_block_size:
+                transformer_options["block_size"] = int(env_block_size)
+            if env_dense_blocks:
+                transformer_options["dense_blocks"] = int(env_dense_blocks)
+            if env_dense_timesteps:
+                transformer_options["dense_timesteps"] = int(env_dense_timesteps)
+            
+            # Set reasonable defaults if not configured
+            transformer_options.setdefault("decay_factor", 0.2)
+            transformer_options.setdefault("block_size", 128)
+            transformer_options.setdefault("dense_blocks", 1)
+            transformer_options.setdefault("dense_timesteps", 1)
+            transformer_options.setdefault("dense_attention_mode", "sageattn")
+            
             setup_radial_attention(transformer, transformer_options, latent, seq_len, latent_video_length, context_options=context_options)
 
         # Experimental args

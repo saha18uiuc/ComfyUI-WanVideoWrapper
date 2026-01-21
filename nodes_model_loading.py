@@ -1122,11 +1122,15 @@ class WanVideoModelLoader:
         mm.cleanup_models()
         mm.soft_empty_cache()
 
+        # WAN_ATTENTION_MODE: Override attention mode via environment variable
+        # Options: sdpa, sageattn, radial_sage_attention, flash_attn_2, etc.
+        # radial_sage_attention gives ~1.9× speedup on Wan2.1 (MIT research)
+        env_attention_mode = os.environ.get("WAN_ATTENTION_MODE", "").strip().lower()
+        if env_attention_mode and env_attention_mode in attention_modes:
+            log.info(f"[WAN_ATTENTION_MODE] Overriding attention mode: {attention_mode} → {env_attention_mode}")
+            attention_mode = env_attention_mode
+        
         if "sage" in attention_mode:
-            try:
-                from sageattention import sageattn
-            except Exception as e:
-                raise ValueError(f"Can't import SageAttention: {str(e)}")
 
         gguf = False
         if model.endswith(".gguf"):
