@@ -764,7 +764,8 @@ class WanI2VCrossAttention(WanSelfAttention):
             k_img = self.norm_k_img(self.k_img(clip_embed).to(self.norm_k_img.weight.dtype)).view(b, -1, n, d).to(x.dtype)
             v_img = self.v_img(clip_embed).view(b, -1, n, d)
             img_x = attention(q, k_img, v_img, attention_mode=self.attention_mode, heads=self.num_heads).flatten(2)
-            x = x_text + img_x
+            x_text.add_(img_x)
+            x = x_text
         else:
             x = x_text
 
@@ -1292,7 +1293,7 @@ class WanAttentionBlock(nn.Module):
                     y[:, tr_end:] * gate_msa
                 ], dim=1).to(input_dtype)
             else:
-                x = x.addcmul(y, gate_msa)
+                x.addcmul_(y, gate_msa)
         del y, gate_msa
 
         # cross-attention & ffn function
@@ -1322,11 +1323,10 @@ class WanAttentionBlock(nn.Module):
                 x = self.split_cross_attn_ffn(x, context, shift_mlp, scale_mlp, gate_mlp, clip_embed, grid_sizes)
                 return x, x_ip, lynx_ref_feature, x_ovi
             else:
-                x = x + self.cross_attn(self.norm3(x.to(self.norm3.weight.dtype)).to(input_dtype), context, grid_sizes, clip_embed=clip_embed, audio_proj=audio_proj, audio_scale=audio_scale,
+                x += self.cross_attn(self.norm3(x.to(self.norm3.weight.dtype)).to(input_dtype), context, grid_sizes, clip_embed=clip_embed, audio_proj=audio_proj, audio_scale=audio_scale,
                                     num_latent_frames=num_latent_frames, nag_params=nag_params, nag_context=nag_context,
                                     rope_func=self.rope_func, inner_t=inner_t, inner_c=inner_c, cross_freqs=cross_freqs,
-                                    adapter_proj=adapter_proj, ip_scale=ip_scale, orig_seq_len=original_seq_len, lynx_x_ip=lynx_x_ip, lynx_ip_scale=lynx_ip_scale, longcat_num_cond_latents=longcat_num_cond_latents)
-                x = x.to(input_dtype)
+                                    adapter_proj=adapter_proj, ip_scale=ip_scale, orig_seq_len=original_seq_len, lynx_x_ip=lynx_x_ip, lynx_ip_scale=lynx_ip_scale, longcat_num_cond_latents=longcat_num_cond_latents).to(input_dtype)
                 # MultiTalk
                 if multitalk_audio_embedding is not None and not isinstance(self, VaceWanAttentionBlock):
 
@@ -1340,7 +1340,8 @@ class WanAttentionBlock(nn.Module):
                     else:
                         x_audio = self.audio_cross_attn(self.norm_x(x.to(self.norm_x.weight.dtype)).to(input_dtype), encoder_hidden_states=multitalk_audio_embedding,
                                                     shape=grid_sizes[0], x_ref_attn_map=x_ref_attn_map, human_num=human_num)
-                    x = x.add(x_audio, alpha=audio_scale)
+                    x.add_(x_audio, alpha=audio_scale)
+                    del x_audio
 
                 # MTV-Crafter Motion Attention
                 if self.use_motion_attn and mtv_motion_tokens is not None and mtv_motion_rotary_emb is not None:
@@ -2577,6 +2578,7 @@ class WanModel(torch.nn.Module):
                 scail_x = [u.flatten(2).transpose(1, 2) * scail_input.get("pose_strength", 1) for u in scail_x]
                 x = [torch.cat([u, v], dim=1) for u, v in zip(x, scail_x)]
                 seq_len += scail_x[0].shape[1]
+                del scail_x
                 pose_frame_shape = scail_pose_latents.shape
 
         seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.int32)
