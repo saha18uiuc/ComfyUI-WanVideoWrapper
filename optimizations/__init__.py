@@ -70,6 +70,43 @@ from .integration import (
     estimate_optimization_benefit,
 )
 
+# Token Merging
+from .token_merging import (
+    apply_tome_to_model,
+    remove_tome_from_model,
+    estimate_tome_speedup,
+    bipartite_soft_matching,
+)
+
+# CFG Optimizations
+from .cfg_optimization import (
+    rescale_cfg_output,
+    get_adaptive_cfg_schedule,
+    AdaptiveCFGScheduler,
+    momentum_velocity_estimation,
+    compute_perpendicular_cfg,
+)
+
+# Temporal Optimizations
+from .temporal_optimization import (
+    create_local_temporal_mask,
+    apply_local_temporal_attention,
+    TemporalAttentionCache,
+    LocalTemporalAttention,
+    apply_temporal_locality,
+    estimate_temporal_savings,
+)
+
+# Solver Optimizations
+from .solver_optimization import (
+    VelocityEMAEstimator,
+    compute_optimal_timesteps,
+    AdaptiveStepController,
+    heun_step_with_error,
+    OptimizedFlowSolver,
+    estimate_solver_benefit,
+)
+
 __all__ = [
     # LoRA fast-path
     'PackedLoRA',
@@ -97,4 +134,29 @@ __all__ = [
     'apply_default_optimizations',
     'optimized_inference',
     'estimate_optimization_benefit',
+    # Token Merging
+    'apply_tome_to_model',
+    'remove_tome_from_model',
+    'estimate_tome_speedup',
+    'bipartite_soft_matching',
+    # CFG Optimizations
+    'rescale_cfg_output',
+    'get_adaptive_cfg_schedule',
+    'AdaptiveCFGScheduler',
+    'momentum_velocity_estimation',
+    'compute_perpendicular_cfg',
+    # Temporal Optimizations
+    'create_local_temporal_mask',
+    'apply_local_temporal_attention',
+    'TemporalAttentionCache',
+    'LocalTemporalAttention',
+    'apply_temporal_locality',
+    'estimate_temporal_savings',
+    # Solver Optimizations
+    'VelocityEMAEstimator',
+    'compute_optimal_timesteps',
+    'AdaptiveStepController',
+    'heun_step_with_error',
+    'OptimizedFlowSolver',
+    'estimate_solver_benefit',
 ]
