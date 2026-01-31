@@ -144,6 +144,21 @@ class WanVideoSampler:
         if model["auto_cpu_offload"] is False:
             transformer = compile_model(transformer, model["compile_args"])
 
+        # ============================================================================
+        # MATH-HEAVY OPTIMIZATIONS
+        # Enable low-rank LoRA and other optimizations for significant speedups
+        # ============================================================================
+        try:
+            from .optimizations import apply_default_optimizations
+            opt_enabled = transformer_options.get("enable_math_optimizations", True)
+            if opt_enabled and not getattr(transformer, '_math_optimizations_applied', False):
+                opt_mgr = apply_default_optimizations(transformer, verbose=False)
+                transformer._math_optimizations_applied = True
+                transformer._optimization_manager = opt_mgr
+                log.info(f"[Optimizations] Applied: {', '.join(opt_mgr.get_stats().get('optimizations_applied', []))}")
+        except Exception as e:
+            log.warning(f"[Optimizations] Could not apply optimizations: {e}")
+
         multitalk_sampling = image_embeds.get("multitalk_sampling", False)
 
         if multitalk_sampling and context_options is not None:

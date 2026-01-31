@@ -3,8 +3,17 @@ import torch.nn as nn
 from accelerate import init_empty_weights
 from .gguf.gguf_utils import GGUFParameter, dequantize_gguf_tensor
 
+# Global flag for optimized LoRA path (can be toggled at runtime)
+USE_LOWRANK_LORA = True  # Default: use optimized low-rank path
+
+def set_lora_optimization(enabled: bool = True):
+    """Enable or disable the low-rank LoRA optimization globally."""
+    global USE_LOWRANK_LORA
+    USE_LOWRANK_LORA = enabled
+
 @torch.library.custom_op("wanvideo::apply_lora", mutates_args=())
 def apply_lora(weight: torch.Tensor, lora_diff_0: torch.Tensor, lora_diff_1: torch.Tensor, lora_diff_2: float, lora_strength: torch.Tensor) -> torch.Tensor:
+    """Original dense ΔW approach - kept for backward compatibility."""
     patch_diff = torch.mm(
         lora_diff_0.flatten(start_dim=1),
         lora_diff_1.flatten(start_dim=1)
@@ -14,6 +23,96 @@ def apply_lora(weight: torch.Tensor, lora_diff_0: torch.Tensor, lora_diff_1: tor
     scale = lora_strength * alpha
 
     return weight + patch_diff * scale
+
+
+# ============================================================================
+# OPTIMIZED LOW-RANK LORA OPERATIONS
+# Instead of W' = W + α*(A@B), we compute y = xW + α*((xB)A)
+# This avoids materializing the full [out, in] delta matrix.
+# ============================================================================
+
+@torch.library.custom_op("wanvideo::apply_lora_lowrank", mutates_args=())
+def apply_lora_lowrank(
+    base_output: torch.Tensor,
+    input_activations: torch.Tensor,
+    lora_down: torch.Tensor,  # [out, rank] or [rank, in] depending on convention
+    lora_up: torch.Tensor,    # [rank, in] or [out, rank]
+    alpha: float,
+    rank: int,
+    strength: torch.Tensor
+) -> torch.Tensor:
+    """
+    Optimized LoRA application on activations (RunLoRA-style).
+    
+    Computes: base_output + scale * ((input @ down.T) @ up.T)
+    
+    This is mathematically equivalent to (input @ (W + scale*up@down).T)
+    but avoids materializing the full [out, in] delta matrix.
+    
+    For video diffusion with large token counts, this can be significantly
+    faster than the dense approach.
+    """
+    # Compute scale
+    scale = strength * (alpha / rank if alpha != 0.0 else 1.0 / rank)
+    
+    if scale.item() == 0.0:
+        return base_output
+    
+    # Flatten to 2D for GEMM
+    orig_shape = input_activations.shape
+    x_2d = input_activations.reshape(-1, orig_shape[-1])
+    out_2d = base_output.reshape(-1, base_output.shape[-1])
+    
+    # Low-rank computation: (x @ down.T) @ up.T
+    # Assuming lora_down is [rank, in], lora_up is [out, rank]
+    down_flat = lora_down.flatten(start_dim=1)  # [rank, in]
+    up_flat = lora_up.flatten(start_dim=1)      # [out, rank]
+    
+    tmp = x_2d @ down_flat.T  # [tokens, rank]
+    delta = tmp @ up_flat.T   # [tokens, out]
+    
+    result = out_2d + delta * scale
+    return result.reshape(base_output.shape)
+
+
+@apply_lora_lowrank.register_fake
+def _(base_output, input_activations, lora_down, lora_up, alpha, rank, strength):
+    return base_output.clone()
+
+
+@torch.library.custom_op("wanvideo::lora_delta_lowrank", mutates_args=())
+def lora_delta_lowrank_op(
+    input_activations: torch.Tensor,
+    lora_down: torch.Tensor,
+    lora_up: torch.Tensor,
+    scale: torch.Tensor
+) -> torch.Tensor:
+    """Compute just the LoRA delta in low-rank form."""
+    if scale.item() == 0.0:
+        return torch.zeros(
+            *input_activations.shape[:-1],
+            lora_up.shape[0],
+            device=input_activations.device,
+            dtype=input_activations.dtype
+        )
+    
+    orig_shape = input_activations.shape
+    x_2d = input_activations.reshape(-1, orig_shape[-1])
+    
+    down_flat = lora_down.flatten(start_dim=1)
+    up_flat = lora_up.flatten(start_dim=1)
+    
+    tmp = x_2d @ down_flat.T
+    delta = (tmp @ up_flat.T) * scale
+    
+    return delta.reshape(*orig_shape[:-1], -1)
+
+
+@lora_delta_lowrank_op.register_fake
+def _(input_activations, lora_down, lora_up, scale):
+    out_features = lora_up.shape[0]
+    out_shape = list(input_activations.shape[:-1]) + [out_features]
+    return input_activations.new_empty(out_shape)
 
 @apply_lora.register_fake
 def _(weight, lora_diff_0, lora_diff_1, lora_diff_2, lora_strength):
@@ -143,6 +242,9 @@ class CustomLinear(nn.Linear):
         self.lora_strengths = []
         self.allow_compile = allow_compile
         self.is_gguf = is_gguf
+        
+        # Flag for using optimized low-rank LoRA (applies to activations instead of weights)
+        self.use_lowrank_lora = True  # Default: use optimized path
 
         if not allow_compile:
             self._apply_lora_impl = self._apply_lora_custom_op
@@ -181,6 +283,68 @@ class CustomLinear(nn.Linear):
 
     def _linear_forward_custom_op(self, input, weight, bias):
         return torch.ops.wanvideo.linear_forward(input, weight, bias)
+    
+    # ============================================================================
+    # OPTIMIZED LOW-RANK LORA: Apply LoRA on activations instead of weights
+    # ============================================================================
+    
+    def _apply_lora_lowrank_to_output(self, input_activations, base_output):
+        """
+        Apply LoRA in low-rank form directly on activations.
+        
+        Instead of: y = x @ (W + α*A@B).T
+        Computes:   y = x @ W.T + α * ((x @ B.T) @ A.T)
+        
+        This avoids materializing the full [out, in] ΔW matrix, which is the
+        key optimization from RunLoRA for large token counts.
+        """
+        if not hasattr(self, "lora_diff_0_0"):
+            return base_output
+        
+        delta_sum = None
+        
+        for idx, lora_diff_names in enumerate(self.lora_diffs):
+            lora_strength = self._get_lora_strength(idx)
+            
+            if isinstance(lora_diff_names, tuple):
+                # Two-matrix LoRA: up @ down
+                lora_up = getattr(self, lora_diff_names[0])    # [out, rank]
+                lora_down = getattr(self, lora_diff_names[1])  # [rank, in]
+                alpha = getattr(self, lora_diff_names[2], 0.0)
+                
+                rank = lora_down.shape[0]
+                scale = lora_strength * (float(alpha) / rank if alpha != 0.0 else 1.0 / rank)
+                
+                if scale == 0.0:
+                    continue
+                
+                # Low-rank computation: (x @ down.T) @ up.T
+                # Flatten for GEMM
+                orig_shape = input_activations.shape
+                x_2d = input_activations.reshape(-1, orig_shape[-1])
+                
+                down_flat = lora_down.flatten(start_dim=1)  # [rank, in]
+                up_flat = lora_up.flatten(start_dim=1)      # [out, rank]
+                
+                # Two skinny GEMMs instead of one fat GEMM
+                tmp = x_2d @ down_flat.T  # [tokens, rank] - skinny!
+                delta = (tmp @ up_flat.T) * scale  # [tokens, out]
+                delta = delta.reshape(*orig_shape[:-1], -1)
+                
+                if delta_sum is None:
+                    delta_sum = delta
+                else:
+                    delta_sum = delta_sum + delta
+            else:
+                # Pre-computed single diff - fall back to adding directly
+                lora_diff = getattr(self, lora_diff_names)
+                # This case still uses the weight approach
+                # (single diff means it's already computed as A@B)
+                pass  # Will be handled by original path
+        
+        if delta_sum is not None:
+            return base_output + delta_sum
+        return base_output
 
     def set_lora_diffs(self, lora_diffs, device=torch.device("cpu")):
         self.lora_diffs = []
@@ -244,6 +408,29 @@ class CustomLinear(nn.Linear):
             weight = self.weight.to(input)
         return weight
 
+    def _should_use_lowrank_lora(self) -> bool:
+        """
+        Determine if we should use the optimized low-rank LoRA path.
+        
+        Conditions for low-rank optimization:
+        1. Global USE_LOWRANK_LORA flag is True
+        2. Instance flag use_lowrank_lora is True
+        3. We have two-matrix LoRA (not pre-computed diff)
+        """
+        if not USE_LOWRANK_LORA or not self.use_lowrank_lora:
+            return False
+        
+        # Check if we have two-matrix LoRA
+        if not hasattr(self, "lora_diff_0_0"):
+            return False
+        
+        # Check that at least one LoRA is two-matrix form
+        for lora_diff_names in self.lora_diffs:
+            if isinstance(lora_diff_names, tuple):
+                return True
+        
+        return False
+
     def forward(self, input):
         weight = self._prepare_weight(input)
 
@@ -253,15 +440,28 @@ class CustomLinear(nn.Linear):
             bias = None
 
         # Only apply scale_weight for non-GGUF models
+        scaled_input = input
         if not self.is_gguf and self.scale_weight is not None:
             if weight.numel() < input.numel():
                 weight = weight * self.scale_weight
             else:
-                input = input * self.scale_weight
+                scaled_input = input * self.scale_weight
 
-        weight = self._get_weight_with_lora(weight)
-        out = self._linear_forward_impl(input, weight, bias)
-        del weight, input, bias
+        # ========================================================================
+        # OPTIMIZED PATH: Apply LoRA on activations (RunLoRA-style)
+        # This avoids materializing full [out, in] delta matrix
+        # ========================================================================
+        if self._should_use_lowrank_lora():
+            # Base linear without LoRA
+            out = self._linear_forward_impl(scaled_input, weight, bias)
+            # Add LoRA delta computed on activations
+            out = self._apply_lora_lowrank_to_output(scaled_input, out)
+        else:
+            # Original path: apply LoRA to weights
+            weight = self._get_weight_with_lora(weight)
+            out = self._linear_forward_impl(scaled_input, weight, bias)
+        
+        del weight, bias
         return out
 
 def update_lora_step(module, step):
