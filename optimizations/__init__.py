@@ -70,12 +70,20 @@ from .integration import (
     estimate_optimization_benefit,
 )
 
-# Token Merging
+# Token Merging (generic)
 from .token_merging import (
     apply_tome_to_model,
     remove_tome_from_model,
     estimate_tome_speedup,
     bipartite_soft_matching,
+)
+
+# Token Merging (WanVideo-specific)
+from .tome_wanvideo import (
+    patch_wanvideo_tome,
+    unpatch_wanvideo_tome,
+    set_tome_ratio,
+    estimate_wanvideo_tome_speedup,
 )
 
 # CFG Optimizations
@@ -134,11 +142,16 @@ __all__ = [
     'apply_default_optimizations',
     'optimized_inference',
     'estimate_optimization_benefit',
-    # Token Merging
+    # Token Merging (generic)
     'apply_tome_to_model',
     'remove_tome_from_model',
     'estimate_tome_speedup',
     'bipartite_soft_matching',
+    # Token Merging (WanVideo-specific)
+    'patch_wanvideo_tome',
+    'unpatch_wanvideo_tome',
+    'set_tome_ratio',
+    'estimate_wanvideo_tome_speedup',
     # CFG Optimizations
     'rescale_cfg_output',
     'get_adaptive_cfg_schedule',

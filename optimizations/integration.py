@@ -57,6 +57,15 @@ try:
 except ImportError:
     HAS_WARMUP = False
 
+try:
+    from .tome_wanvideo import patch_wanvideo_tome, unpatch_wanvideo_tome, set_tome_ratio
+    HAS_TOME = True
+except ImportError:
+    HAS_TOME = False
+    patch_wanvideo_tome = None
+    unpatch_wanvideo_tome = None
+    set_tome_ratio = None
+
 
 @dataclass
 class OptimizationConfig:
@@ -71,6 +80,11 @@ class OptimizationConfig:
     # Triton kernels
     enable_triton_rmsnorm: bool = True  # Fused RMSNorm
     enable_triton_swiglu: bool = True   # Fused SwiGLU
+    
+    # Token Merging (ToMe)
+    enable_tome: bool = False  # Token merging for attention speedup (disabled by default - experimental)
+    tome_ratio: float = 0.3   # Fraction of tokens to merge (0.0-0.5)
+    tome_min_tokens: int = 2048  # Minimum tokens to apply ToMe
     
     # Warmup
     enable_warmup: bool = True  # Run warmup to eliminate compilation overhead
@@ -156,7 +170,25 @@ class OptimizationManager:
                 if self.config.verbose:
                     print(f"[Optimization] SwiGLU patch failed: {e}")
         
-        # 5. Model warmup
+        # 5. Token Merging (ToMe) for self-attention speedup
+        if self.config.enable_tome and HAS_TOME and patch_wanvideo_tome:
+            try:
+                patched = patch_wanvideo_tome(
+                    model,
+                    ratio=self.config.tome_ratio,
+                    min_tokens=self.config.tome_min_tokens,
+                    verbose=self.config.verbose,
+                )
+                results['optimizations'].append(f'tome ({patched} modules, {self.config.tome_ratio*100:.0f}% merge)')
+                self._stats['patched_modules'] += patched
+                self._stats['tome_ratio'] = self.config.tome_ratio
+                if self.config.verbose:
+                    print(f"[Optimization] Enabled ToMe for {patched} self-attention modules")
+            except Exception as e:
+                if self.config.verbose:
+                    print(f"[Optimization] ToMe patch failed: {e}")
+        
+        # 6. Model warmup
         if self.config.enable_warmup and HAS_WARMUP and warmup_shapes:
             try:
                 start = time.perf_counter()
