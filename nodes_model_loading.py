@@ -54,6 +54,9 @@ update_folder_names_and_paths("unet_gguf", ["diffusion_models", "unet"])
 
 class WanVideoModel(comfy.model_base.BaseModel):
     def __init__(self, *args, **kwargs):
+        # Set diffusion_model before super().__init__() for ComfyUI compatibility
+        # (ComfyUI's BaseModel now accesses self.diffusion_model in __init__)
+        self.diffusion_model = None
         super().__init__(*args, **kwargs)
         self.pipeline = {}
 
