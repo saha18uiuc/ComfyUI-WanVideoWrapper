@@ -27,6 +27,7 @@ Usage:
     print(opt_mgr.get_stats())
 """
 
+import os
 import torch
 import torch.nn as nn
 from typing import Dict, Optional, Any, List
@@ -67,9 +68,53 @@ except ImportError:
     set_tome_ratio = None
 
 
+def _env_bool(key: str, default: bool) -> bool:
+    """Get boolean from environment variable."""
+    val = os.environ.get(key, "").lower()
+    if val in ("1", "true", "yes", "on"):
+        return True
+    elif val in ("0", "false", "no", "off"):
+        return False
+    return default
+
+
+def _env_float(key: str, default: float) -> float:
+    """Get float from environment variable."""
+    val = os.environ.get(key)
+    if val is not None:
+        try:
+            return float(val)
+        except ValueError:
+            pass
+    return default
+
+
+def _env_int(key: str, default: int) -> int:
+    """Get int from environment variable."""
+    val = os.environ.get(key)
+    if val is not None:
+        try:
+            return int(val)
+        except ValueError:
+            pass
+    return default
+
+
 @dataclass
 class OptimizationConfig:
-    """Configuration for WanVideo optimizations."""
+    """
+    Configuration for WanVideo optimizations.
+    
+    All settings can be overridden via environment variables:
+        WAN_OPT_LOWRANK_LORA=1       # Enable low-rank LoRA (default: 1)
+        WAN_OPT_KV_CACHE=1           # Enable K/V caching (default: 1)
+        WAN_OPT_TRITON_RMSNORM=1     # Enable Triton RMSNorm (default: 1)
+        WAN_OPT_TRITON_SWIGLU=1      # Enable Triton SwiGLU (default: 1)
+        WAN_OPT_TOME=1               # Enable Token Merging (default: 0)
+        WAN_OPT_TOME_RATIO=0.3       # ToMe merge ratio (default: 0.3)
+        WAN_OPT_WARMUP=1             # Enable warmup (default: 1)
+        WAN_OPT_VERBOSE=1            # Verbose logging (default: 0)
+    """
     
     # LoRA optimizations
     enable_lowrank_lora: bool = True  # Use low-rank activation form
@@ -93,6 +138,23 @@ class OptimizationConfig:
     # Debug/stats
     verbose: bool = False
     collect_stats: bool = True
+    
+    @classmethod
+    def from_env(cls) -> 'OptimizationConfig':
+        """Create config from environment variables."""
+        return cls(
+            enable_lowrank_lora=_env_bool("WAN_OPT_LOWRANK_LORA", True),
+            enable_kv_cache=_env_bool("WAN_OPT_KV_CACHE", True),
+            enable_triton_rmsnorm=_env_bool("WAN_OPT_TRITON_RMSNORM", True),
+            enable_triton_swiglu=_env_bool("WAN_OPT_TRITON_SWIGLU", True),
+            enable_tome=_env_bool("WAN_OPT_TOME", False),
+            tome_ratio=_env_float("WAN_OPT_TOME_RATIO", 0.3),
+            tome_min_tokens=_env_int("WAN_OPT_TOME_MIN_TOKENS", 2048),
+            enable_warmup=_env_bool("WAN_OPT_WARMUP", True),
+            warmup_runs=_env_int("WAN_OPT_WARMUP_RUNS", 2),
+            verbose=_env_bool("WAN_OPT_VERBOSE", False),
+            collect_stats=_env_bool("WAN_OPT_COLLECT_STATS", True),
+        )
 
 
 class OptimizationManager:
@@ -297,7 +359,8 @@ class OptimizationManager:
 # Convenience functions
 def apply_default_optimizations(
     model: nn.Module,
-    verbose: bool = True
+    verbose: bool = None,
+    use_env_config: bool = True,
 ) -> OptimizationManager:
     """
     Apply default optimizations to a model.
@@ -305,15 +368,33 @@ def apply_default_optimizations(
     This is the simplest way to enable optimizations:
         from optimizations.integration import apply_default_optimizations
         opt_mgr = apply_default_optimizations(transformer)
+    
+    Reads from environment variables when use_env_config=True:
+        WAN_OPT_LOWRANK_LORA=1       # Low-rank LoRA (default: on)
+        WAN_OPT_KV_CACHE=1           # K/V caching (default: on)
+        WAN_OPT_TRITON_RMSNORM=1     # Triton RMSNorm (default: on)
+        WAN_OPT_TRITON_SWIGLU=1      # Triton SwiGLU (default: on)
+        WAN_OPT_TOME=1               # Token Merging (default: off)
+        WAN_OPT_TOME_RATIO=0.3       # ToMe ratio (default: 0.3)
+        WAN_OPT_VERBOSE=1            # Verbose (default: off)
     """
-    config = OptimizationConfig(
-        enable_lowrank_lora=True,
-        enable_kv_cache=True,
-        enable_triton_rmsnorm=True,
-        enable_triton_swiglu=True,
-        enable_warmup=False,  # Skip warmup for faster startup
-        verbose=verbose,
-    )
+    if use_env_config:
+        config = OptimizationConfig.from_env()
+        # Override verbose if explicitly passed
+        if verbose is not None:
+            config.verbose = verbose
+    else:
+        config = OptimizationConfig(
+            enable_lowrank_lora=True,
+            enable_kv_cache=True,
+            enable_triton_rmsnorm=True,
+            enable_triton_swiglu=True,
+            enable_warmup=False,  # Skip warmup for faster startup
+            verbose=verbose if verbose is not None else False,
+        )
+    
+    # Disable warmup in default mode for faster startup
+    config.enable_warmup = False
     
     mgr = OptimizationManager(config)
     mgr.optimize_model(model)
