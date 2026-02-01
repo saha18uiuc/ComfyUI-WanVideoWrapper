@@ -52,17 +52,6 @@ def update_folder_names_and_paths(key, targets=[]):
         log.warning(f"Unknown file list already present on key {key}: {base}")
 update_folder_names_and_paths("unet_gguf", ["diffusion_models", "unet"])
 
-class WanVideoModel(comfy.model_base.BaseModel):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.pipeline = {}
-
-    def __getitem__(self, k):
-        return self.pipeline[k]
-
-    def __setitem__(self, k, v):
-        self.pipeline[k] = v
-
 try:
     from comfy.latent_formats import Wan21, Wan22
     latent_format = Wan21
@@ -71,16 +60,27 @@ except: #for backwards compatibility
     from comfy.latent_formats import HunyuanVideo
     latent_format = HunyuanVideo
 
+class WanVideoModel(torch.nn.Module):
+    def __init__(self, model_config, transformer, device=None):
+        super().__init__()
+        self.latent_format = model_config.latent_format
+        self.model_config = model_config
+        self.device = device
+        self.current_patcher = None
+        self.diffusion_model = transformer
+        self.pipeline = {}
+
+    def __getitem__(self, k):
+        return self.pipeline[k]
+
+    def __setitem__(self, k, v):
+        self.pipeline[k] = v
+
 class WanVideoModelConfig:
-    def __init__(self, dtype, latent_format=latent_format):
+    def __init__(self, latent_format=latent_format):
         self.unet_config = {}
         self.unet_extra_config = {}
         self.latent_format = latent_format
-        #self.latent_format.latent_channels = 16
-        self.manual_cast_dtype = dtype
-        self.sampling_settings = {"multiplier": 1.0}
-        self.memory_usage_factor = 2.0
-        self.unet_config["disable_unet_model_creation"] = True
 
 def filter_state_dict_by_blocks(state_dict, blocks_mapping, layer_filter=[]):
     filtered_dict = {}
@@ -1609,11 +1609,7 @@ class WanVideoModelLoader:
             transformer.text_projection = nn.Sequential(nn.Linear(sd["text_projection.0.weight"].shape[1], text_dim), nn.GELU(approximate='tanh'), nn.Linear(text_dim, text_dim))
 
         latent_format=Wan22 if dim == 3072 else Wan21
-        comfy_model = WanVideoModel(
-            WanVideoModelConfig(base_dtype, latent_format=latent_format),
-            model_type=comfy.model_base.ModelType.FLOW,
-            device=device,
-        )
+        comfy_model = WanVideoModel(WanVideoModelConfig(latent_format=latent_format), device=device, transformer=transformer)
 
         # SteadyDancer
         if "condition_embedding_align.cross_attn.in_proj_bias" in sd:
