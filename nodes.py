@@ -12,6 +12,17 @@ from comfy.utils import ProgressBar, common_upscale
 from comfy.clip_vision import clip_preprocess, ClipVisionModel
 import folder_paths
 
+# ============================================================================
+# ComfyUI API compatibility shim
+# Handle rename of load_model_gpu -> load_models_gpu in newer ComfyUI versions
+# ============================================================================
+if not hasattr(mm, 'load_model_gpu') and hasattr(mm, 'load_models_gpu'):
+    # Newer ComfyUI: only has load_models_gpu (plural)
+    mm.load_model_gpu = lambda m: mm.load_models_gpu([m])
+elif not hasattr(mm, 'load_models_gpu') and hasattr(mm, 'load_model_gpu'):
+    # Older ComfyUI: only has load_model_gpu (singular)
+    mm.load_models_gpu = lambda models: [mm.load_model_gpu(m) for m in models]
+
 script_directory = os.path.dirname(os.path.abspath(__file__))
 
 device = mm.get_torch_device()

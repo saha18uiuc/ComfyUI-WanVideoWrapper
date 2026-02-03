@@ -52,11 +52,18 @@ def update_folder_names_and_paths(key, targets=[]):
         log.warning(f"Unknown file list already present on key {key}: {base}")
 update_folder_names_and_paths("unet_gguf", ["diffusion_models", "unet"])
 
+class _DummyDiffusionModel(nn.Module):
+    """Minimal stub to satisfy ComfyUI's archive_model_dtypes during init.
+    ComfyUI calls named_modules() on diffusion_model in BaseModel.__init__,
+    so we need a real nn.Module, not None."""
+    pass
+
 class WanVideoModel(comfy.model_base.BaseModel):
     def __init__(self, *args, **kwargs):
         # Set diffusion_model before super().__init__() for ComfyUI compatibility
-        # (ComfyUI's BaseModel now accesses self.diffusion_model in __init__)
-        self.diffusion_model = None
+        # ComfyUI's BaseModel now calls archive_model_dtypes(self.diffusion_model)
+        # which iterates named_modules(), so we need a real nn.Module (not None)
+        self.diffusion_model = _DummyDiffusionModel()
         super().__init__(*args, **kwargs)
         self.pipeline = {}
 
