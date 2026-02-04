@@ -218,6 +218,24 @@ class WanVideoSampler:
             if not isinstance(ovi_audio_cfg, list):
                 ovi_audio_cfg = [ovi_audio_cfg] * (steps + 1)
 
+        # ============================================================================
+        # CFG OVERRIDE: Environment variable to force CFG scale
+        # This enables CFG-free inference with distilled models for ~2x speedup
+        # Set CFG_SCALE=1.0 in environment to skip unconditional pass
+        # ============================================================================
+        cfg_override = os.environ.get("CFG_SCALE")
+        if cfg_override is not None:
+            try:
+                cfg_val = float(cfg_override)
+                original_cfg = cfg[0] if isinstance(cfg, list) else cfg
+                if cfg_val != original_cfg:
+                    log.info(f"[Speed Opt] CFG override: {original_cfg} -> {cfg_val}")
+                    if cfg_val == 1.0:
+                        log.info(f"[Speed Opt] CFG=1.0 enables CFG-free inference (~2x speedup)")
+                cfg = cfg_val
+            except ValueError:
+                pass
+
         if isinstance(cfg, list):
             if steps < len(cfg):
                 log.info(f"Received {len(cfg)} cfg values, but only {steps} steps. Slicing cfg list to match steps.")
