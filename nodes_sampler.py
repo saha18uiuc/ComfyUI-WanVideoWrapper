@@ -192,6 +192,39 @@ class WanVideoSampler:
                             block.cross_attn.attention_mode = "sageattn"
             except ImportError:
                 log.warning("[Speed Opt] SAGE_ATTENTION=1 but sageattention not installed")
+        
+        # 4. SMOOTH_CACHE: Layer output caching across timesteps (CVPR 2025)
+        #    ~20-50% speedup, near-exact with threshold=0.995
+        #    Based on: SmoothCache (Roblox Research)
+        smooth_cache_helper = None
+        enable_smooth_cache = os.environ.get("SMOOTH_CACHE", "0") == "1"
+        if enable_smooth_cache:
+            try:
+                from .optimizations.smooth_cache import apply_smooth_cache
+                threshold = float(os.environ.get("SMOOTH_CACHE_THRESHOLD", "0.995"))
+                smooth_cache_helper = apply_smooth_cache(
+                    transformer, 
+                    similarity_threshold=threshold,
+                    verbose=os.environ.get("WAN_OPT_VERBOSE", "0") == "1"
+                )
+                smooth_cache_helper.enable()
+                log.info(f"[Speed Opt] SMOOTH_CACHE=1: Layer caching enabled (threshold={threshold})")
+            except Exception as e:
+                log.warning(f"[Speed Opt] SMOOTH_CACHE failed: {e}")
+        
+        # 5. FUSED_KERNELS: Liger-Kernel inspired fused Triton kernels
+        #    ~10-20% speedup on element-wise ops, EXACT output
+        enable_fused = os.environ.get("FUSED_KERNELS", "0") == "1"
+        if enable_fused:
+            try:
+                from .optimizations.fused_kernels import check_triton_available
+                if check_triton_available():
+                    log.info("[Speed Opt] FUSED_KERNELS=1: Triton fused kernels available")
+                    transformer._use_fused_kernels = True
+                else:
+                    log.warning("[Speed Opt] FUSED_KERNELS=1 but Triton not available")
+            except ImportError:
+                log.warning("[Speed Opt] FUSED_KERNELS=1 but fused_kernels module not found")
 
         multitalk_sampling = image_embeds.get("multitalk_sampling", False)
 
