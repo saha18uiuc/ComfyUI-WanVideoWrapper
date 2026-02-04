@@ -310,10 +310,14 @@ class CustomLinear(nn.Linear):
                 # Two-matrix LoRA: up @ down
                 lora_up = getattr(self, lora_diff_names[0])    # [out, rank]
                 lora_down = getattr(self, lora_diff_names[1])  # [rank, in]
-                alpha = getattr(self, lora_diff_names[2], 0.0)
+                alpha = getattr(self, lora_diff_names[2], None)
                 
                 rank = lora_down.shape[0]
-                scale = lora_strength * (float(alpha) / rank if alpha != 0.0 else 1.0 / rank)
+                # Handle None or 0 alpha - use standard 1/rank scaling
+                if alpha is None or alpha == 0.0:
+                    scale = lora_strength / rank
+                else:
+                    scale = lora_strength * float(alpha) / rank
                 
                 if scale == 0.0:
                     continue
