@@ -52,18 +52,20 @@ def update_folder_names_and_paths(key, targets=[]):
         log.warning(f"Unknown file list already present on key {key}: {base}")
 update_folder_names_and_paths("unet_gguf", ["diffusion_models", "unet"])
 
-class _DummyDiffusionModel(nn.Module):
+class _DummyDiffusionModel:
     """Minimal stub to satisfy ComfyUI's archive_model_dtypes during init.
-    ComfyUI calls named_modules() on diffusion_model in BaseModel.__init__,
-    so we need a real nn.Module, not None."""
-    pass
+    NOT an nn.Module (to avoid PyTorch's __setattr__ restrictions),
+    but has named_modules() method that ComfyUI needs."""
+    def named_modules(self):
+        return iter([])  # Empty iterator
 
 class WanVideoModel(comfy.model_base.BaseModel):
     def __init__(self, *args, **kwargs):
         # Set diffusion_model before super().__init__() for ComfyUI compatibility
-        # ComfyUI's BaseModel now calls archive_model_dtypes(self.diffusion_model)
-        # which iterates named_modules(), so we need a real nn.Module (not None)
-        self.diffusion_model = _DummyDiffusionModel()
+        # ComfyUI's BaseModel calls archive_model_dtypes(self.diffusion_model)
+        # which iterates named_modules(). Use object.__setattr__ to bypass
+        # PyTorch's nn.Module restrictions before super().__init__()
+        object.__setattr__(self, 'diffusion_model', _DummyDiffusionModel())
         super().__init__(*args, **kwargs)
         self.pipeline = {}
 
