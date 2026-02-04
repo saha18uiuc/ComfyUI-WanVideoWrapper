@@ -1725,8 +1725,9 @@ class WanVideoSampler:
                         base_params['y'] = [image_cond_input] * 2 if image_cond_input is not None else None
                         base_params['clip_fea'] = torch.cat([clip_fea, clip_fea], dim=0)
                         cache_state_uncond = None
+                        # Note: is_uncond is already in base_params (set to False)
                         [noise_pred_cond, noise_pred_uncond_text], _, cache_state_cond = transformer(
-                            context=positive_embeds + negative_embeds, is_uncond=False,
+                            context=positive_embeds + negative_embeds,
                             pred_id=cache_state[0] if cache_state else None,
                             **base_params
                         )
