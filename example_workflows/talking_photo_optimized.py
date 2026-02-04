@@ -1,27 +1,25 @@
 #!/usr/bin/env python3
 """
-Optimized Talking Photo Generation Script for WanVideoWrapper
+Talking Photo Generation Script for WanVideoWrapper
 
-This script runs the talking photo pipeline with all math-heavy optimizations:
-1. Low-rank LoRA (RunLoRA-style activation-based)
-2. Cross-attention K/V caching
-3. Fused Triton kernels (RMSNorm, SwiGLU)
-4. Token Merging (ToMe) for 2x attention speedup
-5. CFG optimizations
+NOTE: Math-heavy optimizations have been DISABLED by default because testing
+showed they caused 2x SLOWDOWN instead of speedup. The overhead of the
+optimizations exceeded their benefits for small batch sizes (CFG batch=2).
 
-Expected speedup: 30-50% faster than baseline
+Root causes identified:
+1. Low-rank LoRA: Python/CUDA dispatch overhead > FLOP savings for batch=1-2
+2. Token Merging: Similarity computation cost > attention reduction benefit
+3. Triton kernels: JIT compilation + suboptimal autotuning for these shapes
 
-Usage:
-    python talking_photo_optimized.py
-    
-Environment variables for optimization control:
-    WAN_OPT_LOWRANK_LORA=1    - Low-rank LoRA (default: on)
-    WAN_OPT_KV_CACHE=1        - K/V caching (default: on)
-    WAN_OPT_TRITON_RMSNORM=1  - Fused RMSNorm (default: on)
-    WAN_OPT_TRITON_SWIGLU=1   - Fused SwiGLU (default: on)
-    WAN_OPT_TOME=1            - Token Merging (default: on in this script)
-    WAN_OPT_TOME_RATIO=0.25   - Fraction to merge (default: 0.25)
-    WAN_OPT_VERBOSE=1         - Verbose logging (default: off)
+This script now runs in BASELINE MODE matching the original performance.
+
+To test individual optimizations, set environment variables before running:
+    WAN_OPT_LOWRANK_LORA=1    - Low-rank LoRA (default: OFF)
+    WAN_OPT_KV_CACHE=1        - K/V caching (default: OFF)
+    WAN_OPT_TRITON_RMSNORM=1  - Fused RMSNorm (default: OFF)
+    WAN_OPT_TRITON_SWIGLU=1   - Fused SwiGLU (default: OFF)
+    WAN_OPT_TOME=1            - Token Merging (default: OFF)
+    WAN_OPT_TOME_RATIO=0.25   - Fraction to merge
 """
 
 import os
@@ -63,30 +61,35 @@ os.environ["AUDIO_SCALE_STRENGTH"] = "2"
 os.environ["WAN_LORA_TIMING"] = "1"
 
 # =============================================================================
-# MATH-HEAVY OPTIMIZATIONS (NEW)
+# MATH-HEAVY OPTIMIZATIONS
 # =============================================================================
-# These control the new optimization modules in optimizations/
+# WARNING: These optimizations were found to cause SLOWDOWNS (not speedups)
+# on small batch sizes (CFG batch=2) due to Python/CUDA dispatch overhead.
+# 
+# ALL DISABLED BY DEFAULT until proper benchmarking can identify which
+# optimizations work for specific hardware/batch configurations.
+#
+# To test individual optimizations, set the corresponding env var to "1"
 
-# 1. Low-rank LoRA: Apply LoRA as activations instead of dense weight delta
-#    Speedup: 1.5-3x on LoRA layers
-os.environ["WAN_OPT_LOWRANK_LORA"] = "1"
+# 1. Low-rank LoRA: Two skinny GEMMs instead of one fat GEMM
+#    DISABLED - Overhead exceeds savings for batch=1-2
+os.environ["WAN_OPT_LOWRANK_LORA"] = "0"
 
 # 2. K/V Caching: Cache cross-attention K/V for constant conditioning
-#    Speedup: 5-10% overall (saves 2 GEMMs per layer per step)
-os.environ["WAN_OPT_KV_CACHE"] = "1"
+#    DISABLED - Minor overhead, negligible benefit
+os.environ["WAN_OPT_KV_CACHE"] = "0"
 
 # 3. Triton Kernels: Fused RMSNorm and SwiGLU
-#    Speedup: 5-10% on these operations
-os.environ["WAN_OPT_TRITON_RMSNORM"] = "1"
-os.environ["WAN_OPT_TRITON_SWIGLU"] = "1"
+#    DISABLED - JIT compilation overhead, shape mismatch issues
+os.environ["WAN_OPT_TRITON_RMSNORM"] = "0"
+os.environ["WAN_OPT_TRITON_SWIGLU"] = "0"
 
 # 4. Token Merging (ToMe): Merge similar tokens before self-attention
-#    Speedup: ~2x on self-attention (biggest single optimization)
-#    Set to 0 if you notice quality degradation
-os.environ["WAN_OPT_TOME"] = "1"
-os.environ["WAN_OPT_TOME_RATIO"] = "0.25"  # Merge 25% of tokens (conservative)
+#    DISABLED - Similarity computation overhead exceeds attention savings
+os.environ["WAN_OPT_TOME"] = "0"
+os.environ["WAN_OPT_TOME_RATIO"] = "0.25"
 
-# 5. Verbose logging (set to 1 to see which optimizations are applied)
+# 5. Verbose logging
 os.environ["WAN_OPT_VERBOSE"] = "0"
 
 # =============================================================================
@@ -146,18 +149,30 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 # RUN
 # =============================================================================
 print("=" * 70)
-print("OPTIMIZED TALKING PHOTO GENERATION")
+print("TALKING PHOTO GENERATION (Baseline Mode)")
 print("=" * 70)
 print()
 print(f"Video: {DURATION_S}s @ {FPS}fps = {MAX_FRAMES} frames, {os.environ['WIDTH']}x{os.environ['HEIGHT']}")
 print(f"Steps: {os.environ['MAX_STEPS']}, Window: {os.environ['FRAME_WINDOW_SIZE']} frames")
 print()
-print("Optimizations enabled:")
-print(f"  - Low-rank LoRA:    {os.environ.get('WAN_OPT_LOWRANK_LORA', '1') == '1'}")
-print(f"  - K/V Caching:      {os.environ.get('WAN_OPT_KV_CACHE', '1') == '1'}")
-print(f"  - Triton RMSNorm:   {os.environ.get('WAN_OPT_TRITON_RMSNORM', '1') == '1'}")
-print(f"  - Triton SwiGLU:    {os.environ.get('WAN_OPT_TRITON_SWIGLU', '1') == '1'}")
-print(f"  - Token Merging:    {os.environ.get('WAN_OPT_TOME', '0') == '1'} (ratio={os.environ.get('WAN_OPT_TOME_RATIO', '0.25')})")
+# Check which optimizations are enabled
+opt_lora = os.environ.get('WAN_OPT_LOWRANK_LORA', '0') == '1'
+opt_kv = os.environ.get('WAN_OPT_KV_CACHE', '0') == '1'
+opt_rmsnorm = os.environ.get('WAN_OPT_TRITON_RMSNORM', '0') == '1'
+opt_swiglu = os.environ.get('WAN_OPT_TRITON_SWIGLU', '0') == '1'
+opt_tome = os.environ.get('WAN_OPT_TOME', '0') == '1'
+any_opt = opt_lora or opt_kv or opt_rmsnorm or opt_swiglu or opt_tome
+
+if any_opt:
+    print("Optimizations ENABLED:")
+    if opt_lora: print("  ✓ Low-rank LoRA")
+    if opt_kv: print("  ✓ K/V Caching")
+    if opt_rmsnorm: print("  ✓ Triton RMSNorm")
+    if opt_swiglu: print("  ✓ Triton SwiGLU")
+    if opt_tome: print(f"  ✓ Token Merging (ratio={os.environ.get('WAN_OPT_TOME_RATIO', '0.25')})")
+else:
+    print("Optimizations: ALL DISABLED (baseline mode)")
+    print("  (Previous optimizations caused slowdowns - investigating)")
 print()
 print(f"Audio: {ref_audio}")
 print(f"Image: {ref_image}")
