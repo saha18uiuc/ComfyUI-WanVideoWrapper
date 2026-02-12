@@ -25,9 +25,14 @@ from ...echoshot.echoshot import rope_apply_z, rope_apply_c, rope_apply_echoshot
 from ...custom_linear import update_lora_step
 
 from ...MTV.mtv import apply_rotary_emb
+try:
+    from .fused_adaln import fused_adaln_rmsnorm, _HAS_TRITON as _HAS_FUSED_ADALN
+except ImportError:
+    _HAS_FUSED_ADALN = False
 from comfy.ldm.flux.math import apply_rope1 as apply_rope_comfy1
 from comfy.ldm.flux.math import apply_rope as apply_rope_comfy
 from comfy import model_management as mm
+
 
 __all__ = ['WanModel']
 
@@ -995,8 +1000,18 @@ class WanAttentionBlock(nn.Module):
     def ffn_chunked(self, mod_x, num_chunks=4):
         seq_len = mod_x.shape[1]
         if seq_len <= 8192 or num_chunks <= 1:
-            return self.ffn(mod_x)
-        return torch.cat([self.ffn(chunk.contiguous()) for chunk in mod_x.chunk(num_chunks, dim=1)], dim=1)
+            return self._ffn_fused(mod_x)
+        return torch.cat([self._ffn_fused(chunk.contiguous()) for chunk in mod_x.chunk(num_chunks, dim=1)], dim=1)
+
+    def _ffn_fused(self, x):
+        """Fused FFN: combines Linear+GELU into single F.linear+F.gelu call,
+        avoiding nn.Sequential dispatch overhead and enabling in-place GELU."""
+        if isinstance(self.ffn, nn.Sequential) and len(self.ffn) == 3:
+            # Standard FFN: Linear -> GELU -> Linear
+            h = F.linear(x, self.ffn[0].weight, self.ffn[0].bias)
+            h = F.gelu(h, approximate='tanh')
+            return F.linear(h, self.ffn[2].weight, self.ffn[2].bias)
+        return self.ffn(x)
 
     #region attention forward
     def forward(
@@ -1068,7 +1083,16 @@ class WanAttentionBlock(nn.Module):
                 torch.addcmul(shift_msa, norm_x[:, tr_end:], 1 + scale_msa)              # after replace → T
             ], dim=1).to(input_dtype)
         else:
-            input_x = self.modulate(self.norm1(x.to(shift_msa.dtype)), shift_msa, scale_msa, seg_idx=self.seg_idx).to(input_dtype)
+            if _HAS_FUSED_ADALN and x.is_cuda and self.seg_idx is None:
+                # Fused AdaLN: RMSNorm + shift + scale in single kernel
+                input_x = fused_adaln_rmsnorm(x, self.norm1.weight, shift_msa, scale_msa, eps=self.norm1.eps)
+                if input_x.dtype != input_dtype:
+                    input_x = input_x.to(input_dtype)
+            else:
+                _norm_in = x if x.dtype == shift_msa.dtype else x.to(shift_msa.dtype)
+                input_x = self.modulate(self.norm1(_norm_in), shift_msa, scale_msa, seg_idx=self.seg_idx)
+                if input_x.dtype != input_dtype:
+                    input_x = input_x.to(input_dtype)
 
         del shift_msa, scale_msa
 
@@ -1328,10 +1352,17 @@ class WanAttentionBlock(nn.Module):
                 x = self.split_cross_attn_ffn(x, context, shift_mlp, scale_mlp, gate_mlp, clip_embed, grid_sizes)
                 return x, x_ip, lynx_ref_feature, x_ovi
             else:
-                x += self.cross_attn(self.norm3(x.to(self.norm3.weight.dtype)).to(input_dtype), context, grid_sizes, clip_embed=clip_embed, audio_proj=audio_proj, audio_scale=audio_scale,
+                _cross_in = x if x.dtype == self.norm3.weight.dtype else x.to(self.norm3.weight.dtype)
+                _cross_normed = self.norm3(_cross_in)
+                if _cross_normed.dtype != input_dtype:
+                    _cross_normed = _cross_normed.to(input_dtype)
+                _cross_out = self.cross_attn(_cross_normed, context, grid_sizes, clip_embed=clip_embed, audio_proj=audio_proj, audio_scale=audio_scale,
                                     num_latent_frames=num_latent_frames, nag_params=nag_params, nag_context=nag_context,
                                     rope_func=self.rope_func, inner_t=inner_t, inner_c=inner_c, cross_freqs=cross_freqs,
-                                    adapter_proj=adapter_proj, ip_scale=ip_scale, orig_seq_len=original_seq_len, lynx_x_ip=lynx_x_ip, lynx_ip_scale=lynx_ip_scale, longcat_num_cond_latents=longcat_num_cond_latents).to(input_dtype)
+                                    adapter_proj=adapter_proj, ip_scale=ip_scale, orig_seq_len=original_seq_len, lynx_x_ip=lynx_x_ip, lynx_ip_scale=lynx_ip_scale, longcat_num_cond_latents=longcat_num_cond_latents)
+                if _cross_out.dtype != input_dtype:
+                    _cross_out = _cross_out.to(input_dtype)
+                x += _cross_out
                 # MultiTalk
                 if multitalk_audio_embedding is not None and not isinstance(self, VaceWanAttentionBlock):
 
@@ -1343,7 +1374,11 @@ class WanAttentionBlock(nn.Module):
                         if audio_output_cond is not None:
                             x_audio = torch.cat([audio_output_cond, x_audio], dim=1).contiguous()
                     else:
-                        x_audio = self.audio_cross_attn(self.norm_x(x.to(self.norm_x.weight.dtype)).to(input_dtype), encoder_hidden_states=multitalk_audio_embedding,
+                        _audio_in = x if x.dtype == self.norm_x.weight.dtype else x.to(self.norm_x.weight.dtype)
+                        _audio_normed = self.norm_x(_audio_in)
+                        if _audio_normed.dtype != input_dtype:
+                            _audio_normed = _audio_normed.to(input_dtype)
+                        x_audio = self.audio_cross_attn(_audio_normed, encoder_hidden_states=multitalk_audio_embedding,
                                                     shape=grid_sizes[0], x_ref_attn_map=x_ref_attn_map, human_num=human_num)
                     x.add_(x_audio, alpha=audio_scale)
                     del x_audio
@@ -1382,10 +1417,12 @@ class WanAttentionBlock(nn.Module):
                         torch.addcmul(shift_mlp, norm2_x[:, tr_end:], 1 + scale_mlp)
                     ], dim=1)
                 else:
-                    mod_x = torch.addcmul(shift_mlp, self.norm2(x.to(shift_mlp.dtype)), 1 + scale_mlp)
+                    _ffn_in = x if x.dtype == shift_mlp.dtype else x.to(shift_mlp.dtype)
+                    mod_x = torch.addcmul(shift_mlp, self.norm2(_ffn_in), 1 + scale_mlp)
 
                 del shift_mlp, scale_mlp
-                x_ffn = self.ffn_chunked(mod_x.to(input_dtype), num_chunks=2 if is_longcat else 1)
+                _ffn_mod = mod_x if mod_x.dtype == input_dtype else mod_x.to(input_dtype)
+                x_ffn = self.ffn_chunked(_ffn_mod, num_chunks=2 if is_longcat else 1)
                 del mod_x
 
         # gate_mlp
@@ -2933,7 +2970,10 @@ class WanModel(torch.nn.Module):
                     _cache_hit = True
 
             if not _cache_hit:
-                self.multitalk_audio_proj.to(self.main_device)
+                # Keep audio_proj on GPU - it's small (~10-50MB) and avoids
+                # costly GPU<->CPU transfers on every cache miss
+                if next(self.multitalk_audio_proj.parameters()).device != self.main_device:
+                    self.multitalk_audio_proj.to(self.main_device)
                 audio_cond = multitalk_audio.to(device=x.device, dtype=self.base_dtype)
                 first_frame_audio_emb_s = audio_cond[:, :1, ...] 
                 latter_frame_audio_emb = audio_cond[:, 1:, ...] 
@@ -2947,7 +2987,7 @@ class WanModel(torch.nn.Module):
                 latter_middle_frame_audio_emb = rearrange(latter_middle_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c") 
                 latter_frame_audio_emb_s = torch.concat([latter_first_frame_audio_emb, latter_middle_frame_audio_emb, latter_last_frame_audio_emb], dim=2) 
                 multitalk_audio_embedding = self.multitalk_audio_proj(first_frame_audio_emb_s, latter_frame_audio_emb_s)
-                self.multitalk_audio_proj.to(self.offload_device)
+                # Don't offload - keep on GPU for the entire generation
                 human_num = len(multitalk_audio_embedding)
 
             if not _cache_hit:
@@ -3240,7 +3280,8 @@ class WanModel(torch.nn.Module):
                         tqdm.write(f"Applying attention mode override: {attention_mode_override['mode']} at step {current_step} on blocks: {attn_override_blocks if attn_override_blocks is not None else 'all'}")
 
             for b, block in enumerate(self.blocks):
-                mm.throw_exception_if_processing_interrupted()
+                if b % 10 == 0:  # Check every 10 blocks instead of every block to reduce Python overhead
+                    mm.throw_exception_if_processing_interrupted()
                 if attention_mode_override_active and b in attn_override_blocks:
                     attention_mode = attention_mode_override['mode']
                 else:
