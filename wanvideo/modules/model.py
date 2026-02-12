@@ -25,10 +25,6 @@ from ...echoshot.echoshot import rope_apply_z, rope_apply_c, rope_apply_echoshot
 from ...custom_linear import update_lora_step
 
 from ...MTV.mtv import apply_rotary_emb
-try:
-    from .fused_adaln import fused_adaln_layernorm, _HAS_TRITON as _HAS_FUSED_ADALN
-except ImportError:
-    _HAS_FUSED_ADALN = False
 from comfy.ldm.flux.math import apply_rope1 as apply_rope_comfy1
 from comfy.ldm.flux.math import apply_rope as apply_rope_comfy
 from comfy import model_management as mm
@@ -648,6 +644,8 @@ class WanT2VCrossAttention(WanSelfAttention):
         self.attention_mode = attention_mode
         self.ip_adapter = None
         self.k_fusion = None
+        # Cross-attention KV cache: context is static across blocks/timesteps
+        self._crossattn_kv_cache = None  # (context_ptr, k_cached, v_cached)
 
     def forward(self, x, context, grid_sizes=None, clip_embed=None, audio_proj=None, audio_scale=1.0,
                 num_latent_frames=21, nag_params={}, nag_context=None, rope_func="comfy",
@@ -672,12 +670,18 @@ class WanT2VCrossAttention(WanSelfAttention):
             x = self.normalized_attention_guidance(x_positive, x_negative, nag_params)
             del x_positive, x_negative
         else:
-            if is_longcat:
-                k = self.norm_k(self.k(context).to(self.norm_k.weight.dtype).view(b, -1, n, d)).to(x.dtype)
+            # Cross-attention KV cache: context is static, cache K/V projections
+            _cache = self._crossattn_kv_cache
+            _cache_hit = (_cache is not None and _cache[0] == context.data_ptr())
+            if _cache_hit:
+                k, v = _cache[1], _cache[2]
             else:
-                k = self.norm_k(self.k(context).to(self.norm_k.weight.dtype)).to(x.dtype).view(b, -1, n, d)
-
-            v = self.v(context).view(b, -1, n, d)
+                if is_longcat:
+                    k = self.norm_k(self.k(context).to(self.norm_k.weight.dtype).view(b, -1, n, d)).to(x.dtype)
+                else:
+                    k = self.norm_k(self.k(context).to(self.norm_k.weight.dtype)).to(x.dtype).view(b, -1, n, d)
+                v = self.v(context).view(b, -1, n, d)
+                self._crossattn_kv_cache = (context.data_ptr(), k, v)
 
             #EchoShot rope
             if inner_t is not None and cross_freqs is not None:
@@ -747,6 +751,9 @@ class WanI2VCrossAttention(WanSelfAttention):
         self.v_img = nn.Linear(in_features, out_features)
         self.norm_k_img = WanRMSNorm(out_features, eps=eps) if qk_norm else nn.Identity()
         self.attention_mode = attention_mode
+        # Cross-attention KV cache: text context and clip embed are static
+        self._crossattn_kv_cache = None  # (context_ptr, k, v)
+        self._crossattn_img_cache = None  # (clip_ptr, k_img, v_img)
 
     def forward(self, x, context, grid_sizes=None, clip_embed=None, audio_proj=None,
                 audio_scale=1.0, num_latent_frames=21, nag_params={}, nag_context=None, rope_func="comfy",
@@ -764,15 +771,27 @@ class WanI2VCrossAttention(WanSelfAttention):
         if nag_context is not None:
             x_text = self.normalized_attention_guidance(b, n, d, q, context, nag_context, nag_params)
         else:
-            # text attention
-            k = self.norm_k(self.k(context).to(self.norm_k.weight.dtype)).view(b, -1, n, d).to(x.dtype)
-            v = self.v(context).view(b, -1, n, d)
+            # Cross-attention KV cache: text context is static across blocks/timesteps
+            _cache = self._crossattn_kv_cache
+            _cache_hit = (_cache is not None and _cache[0] == context.data_ptr())
+            if _cache_hit:
+                k, v = _cache[1], _cache[2]
+            else:
+                k = self.norm_k(self.k(context).to(self.norm_k.weight.dtype)).view(b, -1, n, d).to(x.dtype)
+                v = self.v(context).view(b, -1, n, d)
+                self._crossattn_kv_cache = (context.data_ptr(), k, v)
             x_text = attention(q, k, v, attention_mode=self.attention_mode, heads=self.num_heads).flatten(2)
 
-        #img attention
+        #img attention - cache clip_embed K/V projections
         if clip_embed is not None:
-            k_img = self.norm_k_img(self.k_img(clip_embed).to(self.norm_k_img.weight.dtype)).view(b, -1, n, d).to(x.dtype)
-            v_img = self.v_img(clip_embed).view(b, -1, n, d)
+            _img_cache = self._crossattn_img_cache
+            _img_hit = (_img_cache is not None and _img_cache[0] == clip_embed.data_ptr())
+            if _img_hit:
+                k_img, v_img = _img_cache[1], _img_cache[2]
+            else:
+                k_img = self.norm_k_img(self.k_img(clip_embed).to(self.norm_k_img.weight.dtype)).view(b, -1, n, d).to(x.dtype)
+                v_img = self.v_img(clip_embed).view(b, -1, n, d)
+                self._crossattn_img_cache = (clip_embed.data_ptr(), k_img, v_img)
             img_x = attention(q, k_img, v_img, attention_mode=self.attention_mode, heads=self.num_heads).flatten(2)
             x_text.add_(img_x)
             x = x_text
@@ -1073,16 +1092,7 @@ class WanAttentionBlock(nn.Module):
                 torch.addcmul(shift_msa, norm_x[:, tr_end:], 1 + scale_msa)              # after replace → T
             ], dim=1).to(input_dtype)
         else:
-            if _HAS_FUSED_ADALN and x.is_cuda and self.seg_idx is None:
-                # Fused AdaLN: LayerNorm + shift + scale in single kernel
-                input_x = fused_adaln_layernorm(x, shift_msa, scale_msa, eps=self.norm1.eps)
-                if input_x.dtype != input_dtype:
-                    input_x = input_x.to(input_dtype)
-            else:
-                _norm_in = x if x.dtype == shift_msa.dtype else x.to(shift_msa.dtype)
-                input_x = self.modulate(self.norm1(_norm_in), shift_msa, scale_msa, seg_idx=self.seg_idx)
-                if input_x.dtype != input_dtype:
-                    input_x = input_x.to(input_dtype)
+            input_x = self.modulate(self.norm1(x.to(shift_msa.dtype)), shift_msa, scale_msa, seg_idx=self.seg_idx).to(input_dtype)
 
         del shift_msa, scale_msa
 
@@ -1342,17 +1352,10 @@ class WanAttentionBlock(nn.Module):
                 x = self.split_cross_attn_ffn(x, context, shift_mlp, scale_mlp, gate_mlp, clip_embed, grid_sizes)
                 return x, x_ip, lynx_ref_feature, x_ovi
             else:
-                _cross_in = x if x.dtype == self.norm3.weight.dtype else x.to(self.norm3.weight.dtype)
-                _cross_normed = self.norm3(_cross_in)
-                if _cross_normed.dtype != input_dtype:
-                    _cross_normed = _cross_normed.to(input_dtype)
-                _cross_out = self.cross_attn(_cross_normed, context, grid_sizes, clip_embed=clip_embed, audio_proj=audio_proj, audio_scale=audio_scale,
+                x += self.cross_attn(self.norm3(x.to(self.norm3.weight.dtype)).to(input_dtype), context, grid_sizes, clip_embed=clip_embed, audio_proj=audio_proj, audio_scale=audio_scale,
                                     num_latent_frames=num_latent_frames, nag_params=nag_params, nag_context=nag_context,
                                     rope_func=self.rope_func, inner_t=inner_t, inner_c=inner_c, cross_freqs=cross_freqs,
-                                    adapter_proj=adapter_proj, ip_scale=ip_scale, orig_seq_len=original_seq_len, lynx_x_ip=lynx_x_ip, lynx_ip_scale=lynx_ip_scale, longcat_num_cond_latents=longcat_num_cond_latents)
-                if _cross_out.dtype != input_dtype:
-                    _cross_out = _cross_out.to(input_dtype)
-                x += _cross_out
+                                    adapter_proj=adapter_proj, ip_scale=ip_scale, orig_seq_len=original_seq_len, lynx_x_ip=lynx_x_ip, lynx_ip_scale=lynx_ip_scale, longcat_num_cond_latents=longcat_num_cond_latents).to(input_dtype)
                 # MultiTalk
                 if multitalk_audio_embedding is not None and not isinstance(self, VaceWanAttentionBlock):
 
@@ -1364,11 +1367,7 @@ class WanAttentionBlock(nn.Module):
                         if audio_output_cond is not None:
                             x_audio = torch.cat([audio_output_cond, x_audio], dim=1).contiguous()
                     else:
-                        _audio_in = x if x.dtype == self.norm_x.weight.dtype else x.to(self.norm_x.weight.dtype)
-                        _audio_normed = self.norm_x(_audio_in)
-                        if _audio_normed.dtype != input_dtype:
-                            _audio_normed = _audio_normed.to(input_dtype)
-                        x_audio = self.audio_cross_attn(_audio_normed, encoder_hidden_states=multitalk_audio_embedding,
+                        x_audio = self.audio_cross_attn(self.norm_x(x.to(self.norm_x.weight.dtype)).to(input_dtype), encoder_hidden_states=multitalk_audio_embedding,
                                                     shape=grid_sizes[0], x_ref_attn_map=x_ref_attn_map, human_num=human_num)
                     x.add_(x_audio, alpha=audio_scale)
                     del x_audio
@@ -1407,12 +1406,10 @@ class WanAttentionBlock(nn.Module):
                         torch.addcmul(shift_mlp, norm2_x[:, tr_end:], 1 + scale_mlp)
                     ], dim=1)
                 else:
-                    _ffn_in = x if x.dtype == shift_mlp.dtype else x.to(shift_mlp.dtype)
-                    mod_x = torch.addcmul(shift_mlp, self.norm2(_ffn_in), 1 + scale_mlp)
+                    mod_x = torch.addcmul(shift_mlp, self.norm2(x.to(shift_mlp.dtype)), 1 + scale_mlp)
 
                 del shift_mlp, scale_mlp
-                _ffn_mod = mod_x if mod_x.dtype == input_dtype else mod_x.to(input_dtype)
-                x_ffn = self.ffn_chunked(_ffn_mod, num_chunks=2 if is_longcat else 1)
+                x_ffn = self.ffn_chunked(mod_x.to(input_dtype), num_chunks=2 if is_longcat else 1)
                 del mod_x
 
         # gate_mlp
@@ -2948,56 +2945,36 @@ class WanModel(torch.nn.Module):
 
         # MultiTalk
         if multitalk_audio is not None:
-            # Cache audio embedding: same audio produces same embedding across timesteps.
-            # Avoids redundant audio_proj computation + GPU<->CPU weight transfers.
-            _mt_cache = getattr(self, '_multitalk_emb_cache', None)
-            _cache_hit = False
-            if _mt_cache is not None:
-                cached_ptr, cached_shape, cached_emb, cached_human = _mt_cache
-                if cached_ptr == multitalk_audio.data_ptr() and cached_shape == multitalk_audio.shape:
-                    multitalk_audio_embedding = cached_emb
-                    human_num = cached_human
-                    _cache_hit = True
+            self.multitalk_audio_proj.to(self.main_device)
+            audio_cond = multitalk_audio.to(device=x.device, dtype=self.base_dtype)
+            first_frame_audio_emb_s = audio_cond[:, :1, ...] 
+            latter_frame_audio_emb = audio_cond[:, 1:, ...] 
+            latter_frame_audio_emb = rearrange(latter_frame_audio_emb, "b (n_t n) w s c -> b n_t n w s c", n=4) 
+            middle_index = self.multitalk_audio_proj.seq_len // 2
+            latter_first_frame_audio_emb = latter_frame_audio_emb[:, :, :1, :middle_index+1, ...] 
+            latter_first_frame_audio_emb = rearrange(latter_first_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c") 
+            latter_last_frame_audio_emb = latter_frame_audio_emb[:, :, -1:, middle_index:, ...] 
+            latter_last_frame_audio_emb = rearrange(latter_last_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c") 
+            latter_middle_frame_audio_emb = latter_frame_audio_emb[:, :, 1:-1, middle_index:middle_index+1, ...] 
+            latter_middle_frame_audio_emb = rearrange(latter_middle_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c") 
+            latter_frame_audio_emb_s = torch.concat([latter_first_frame_audio_emb, latter_middle_frame_audio_emb, latter_last_frame_audio_emb], dim=2) 
+            multitalk_audio_embedding = self.multitalk_audio_proj(first_frame_audio_emb_s, latter_frame_audio_emb_s)
+            self.multitalk_audio_proj.to(self.offload_device)
+            human_num = len(multitalk_audio_embedding)
 
-            if not _cache_hit:
-                # Keep audio_proj on GPU - it's small (~10-50MB) and avoids
-                # costly GPU<->CPU transfers on every cache miss
-                if next(self.multitalk_audio_proj.parameters()).device != self.main_device:
-                    self.multitalk_audio_proj.to(self.main_device)
-                audio_cond = multitalk_audio.to(device=x.device, dtype=self.base_dtype)
-                first_frame_audio_emb_s = audio_cond[:, :1, ...] 
-                latter_frame_audio_emb = audio_cond[:, 1:, ...] 
-                latter_frame_audio_emb = rearrange(latter_frame_audio_emb, "b (n_t n) w s c -> b n_t n w s c", n=4) 
-                middle_index = self.multitalk_audio_proj.seq_len // 2
-                latter_first_frame_audio_emb = latter_frame_audio_emb[:, :, :1, :middle_index+1, ...] 
-                latter_first_frame_audio_emb = rearrange(latter_first_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c") 
-                latter_last_frame_audio_emb = latter_frame_audio_emb[:, :, -1:, middle_index:, ...] 
-                latter_last_frame_audio_emb = rearrange(latter_last_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c") 
-                latter_middle_frame_audio_emb = latter_frame_audio_emb[:, :, 1:-1, middle_index:middle_index+1, ...] 
-                latter_middle_frame_audio_emb = rearrange(latter_middle_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c") 
-                latter_frame_audio_emb_s = torch.concat([latter_first_frame_audio_emb, latter_middle_frame_audio_emb, latter_last_frame_audio_emb], dim=2) 
-                multitalk_audio_embedding = self.multitalk_audio_proj(first_frame_audio_emb_s, latter_frame_audio_emb_s)
-                # Don't offload - keep on GPU for the entire generation
-                human_num = len(multitalk_audio_embedding)
+            # LongCat-Avatar specific
+            if longcat_num_ref_latents > 0:
+                audio_start_ref = multitalk_audio_embedding[:, [0], :, :] # padding
+                multitalk_audio_embedding = torch.cat([audio_start_ref, multitalk_audio_embedding], dim=1).contiguous()
 
-            if not _cache_hit:
-                # Post-process and cache the result
-                # LongCat-Avatar specific
-                if longcat_num_ref_latents > 0:
-                    audio_start_ref = multitalk_audio_embedding[:, [0], :, :] # padding
-                    multitalk_audio_embedding = torch.cat([audio_start_ref, multitalk_audio_embedding], dim=1).contiguous()
+            if longcat_num_cond_latents > 0:
+                multitalk_audio_embedding = multitalk_audio_embedding[:, (-F // self.patch_size[0]):]
 
-                if longcat_num_cond_latents > 0:
-                    multitalk_audio_embedding = multitalk_audio_embedding[:, (-F // self.patch_size[0]):]
-
-                if ref_target_masks is not None:
-                    multitalk_audio_embedding = torch.concat(multitalk_audio_embedding.split(1), dim=2).to(self.base_dtype)
-                    multitalk_audio_embedding = multitalk_audio_embedding.squeeze(0)
-                else:
-                    multitalk_audio_embedding = rearrange(multitalk_audio_embedding, "b t n c -> (b t) n c")
-
-                # Cache for reuse across timesteps (same audio = same embedding)
-                self._multitalk_emb_cache = (multitalk_audio.data_ptr(), multitalk_audio.shape, multitalk_audio_embedding, human_num)
+            if ref_target_masks is not None:
+                multitalk_audio_embedding = torch.concat(multitalk_audio_embedding.split(1), dim=2).to(self.base_dtype)
+                multitalk_audio_embedding = multitalk_audio_embedding.squeeze(0)
+            else:
+                multitalk_audio_embedding = rearrange(multitalk_audio_embedding, "b t n c -> (b t) n c")
 
 
         # convert ref_target_masks to token_ref_target_masks
@@ -3270,8 +3247,7 @@ class WanModel(torch.nn.Module):
                         tqdm.write(f"Applying attention mode override: {attention_mode_override['mode']} at step {current_step} on blocks: {attn_override_blocks if attn_override_blocks is not None else 'all'}")
 
             for b, block in enumerate(self.blocks):
-                if b % 10 == 0:  # Check every 10 blocks instead of every block to reduce Python overhead
-                    mm.throw_exception_if_processing_interrupted()
+                mm.throw_exception_if_processing_interrupted()
                 if attention_mode_override_active and b in attn_override_blocks:
                     attention_mode = attention_mode_override['mode']
                 else:

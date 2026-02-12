@@ -126,26 +126,22 @@ def multitalk_loop(self, **kwargs):
         if mode == "infinitetalk":
             cond_image = original_images[:, :, current_condframe_index:current_condframe_index+1] if cond_image is not None else None
         if multitalk_embeds is not None:
-            # Vectorized audio embedding prep (batched across speakers)
-            center_indices = torch.arange(audio_start_idx, audio_end_idx, audio_stride).unsqueeze(1) + indices.unsqueeze(0)
-            audio_embs_list = []
+            audio_embs = []
+            # split audio with window size
             for human_idx in range(human_num):
-                clamped = torch.clamp(center_indices, min=0, max=audio_embedding[human_idx].shape[0]-1)
-                audio_embs_list.append(audio_embedding[human_idx][clamped])
-            audio_embs = torch.stack(audio_embs_list, dim=0).to(device=device, dtype=dtype)
+                center_indices = torch.arange(audio_start_idx, audio_end_idx, audio_stride).unsqueeze(1) + indices.unsqueeze(0)
+                center_indices = torch.clamp(center_indices, min=0, max=audio_embedding[human_idx].shape[0]-1)
+                audio_emb = audio_embedding[human_idx][center_indices].unsqueeze(0).to(device)
+                audio_embs.append(audio_emb)
+            audio_embs = torch.concat(audio_embs, dim=0).to(dtype)
 
         h, w = (cond_image.shape[-2], cond_image.shape[-1]) if cond_image is not None else (target_h, target_w)
         lat_h, lat_w = h // VAE_STRIDE[1], w // VAE_STRIDE[2]
         latent_frame_num = (frame_num - 1) // 4 + 1
 
-        # Generate noise on CPU (for reproducibility with seed_g) then async transfer
-        _noise_cpu = torch.randn(
+        noise = torch.randn(
             16, latent_frame_num,
-            lat_h, lat_w, dtype=torch.float32, device=torch.device("cpu"), generator=seed_g)
-        try:
-            noise = _noise_cpu.pin_memory().to(device, non_blocking=True)
-        except Exception:
-            noise = _noise_cpu.to(device)
+            lat_h, lat_w, dtype=torch.float32, device=torch.device("cpu"), generator=seed_g).to(device)
 
         # Calculate the correct latent slice based on current iteration
         if is_first_clip:
@@ -263,12 +259,8 @@ def multitalk_loop(self, **kwargs):
 
         # injecting motion frames
         if not is_first_clip and mode == "multitalk":
-            latent_motion_frames = latent_motion_frames.to(device=device, dtype=latent.dtype)
-            _mn = torch.randn(latent_motion_frames.shape, device=torch.device("cpu"), generator=seed_g)
-            try:
-                motion_add_noise = _mn.pin_memory().to(device, non_blocking=True)
-            except Exception:
-                motion_add_noise = _mn.to(device)
+            latent_motion_frames = latent_motion_frames.to(latent.dtype).to(device)
+            motion_add_noise = torch.randn(latent_motion_frames.shape, device=torch.device("cpu"), generator=seed_g).to(device).contiguous()
             add_latent = add_noise(latent_motion_frames, motion_add_noise, timesteps[0])
             latent[:, :add_latent.shape[1]] = add_latent
 
@@ -343,7 +335,7 @@ def multitalk_loop(self, **kwargs):
         sampling_pbar = tqdm(total=len(timesteps)-1, desc=f"Sampling audio indices {audio_start_idx}-{audio_end_idx}", position=0, leave=True)
         for i in range(len(timesteps)-1):
             timestep = timesteps[i]
-            latent_model_input = latent if latent.device == device else latent.to(device)
+            latent_model_input = latent.to(device)
             if mode == "infinitetalk":
                 if humo_image_cond is None or not is_first_clip:
                     latent_model_input[:, :cur_motion_frames_latent_num] = latent_motion_frames
@@ -356,7 +348,7 @@ def multitalk_loop(self, **kwargs):
                 uni3c_data = uni3c_data)
 
             if callback is not None:
-                callback_latent = (latent_model_input - noise_pred * timestep / 1000).detach().permute(1,0,2,3)
+                callback_latent = (latent_model_input.to(device) - noise_pred.to(device) * timestep.to(device) / 1000).detach().permute(1,0,2,3)
                 callback(step_iteration_count, callback_latent, None, estimated_iterations*(len(timesteps)-1))
                 del callback_latent
 
@@ -377,18 +369,14 @@ def multitalk_loop(self, **kwargs):
             # differential diffusion inpaint
             if masks is not None:
                 if i < len(timesteps) - 1:
-                    image_latent = add_noise(original_image, noise, timesteps[i+1])
+                    image_latent = add_noise(original_image.to(device), noise.to(device), timesteps[i+1])
                     mask = masks[i].to(latent)
                     latent = image_latent * mask + latent * (1-mask)
 
             # injecting motion frames
             if not is_first_clip and mode == "multitalk":
-                latent_motion_frames = latent_motion_frames.to(device=device, dtype=latent.dtype)
-                _mn2 = torch.randn(latent_motion_frames.shape, device=torch.device("cpu"), generator=seed_g)
-                try:
-                    motion_add_noise = _mn2.pin_memory().to(device, non_blocking=True)
-                except Exception:
-                    motion_add_noise = _mn2.to(device)
+                latent_motion_frames = latent_motion_frames.to(latent.dtype).to(device)
+                motion_add_noise = torch.randn(latent_motion_frames.shape, device=torch.device("cpu"), generator=seed_g).to(device).contiguous()
                 add_latent = add_noise(latent_motion_frames, motion_add_noise, timesteps[i+1])
                 latent[:, :add_latent.shape[1]] = add_latent
             else:
@@ -399,23 +387,14 @@ def multitalk_loop(self, **kwargs):
         if _gc_was_enabled:
             gc.enable()
         del noise, latent_motion_frames
-        if humo_image_cond is not None and humo_reference_count > 0:
-            latent = latent[:,:-humo_reference_count]
-
-        # Optimization: try to skip transformer offload between windows.
-        # Check if we have enough free VRAM to keep transformer + run VAE decode.
-        # VAE decode needs ~1-2GB extra. If not enough, fall back to offload.
-        _skip_offload = False
-        if torch.cuda.is_available():
-            _free_mem = torch.cuda.mem_get_info(device)[0] / (1024**3)  # free VRAM in GB
-            _skip_offload = _free_mem > 2.0  # Need ~2GB for VAE decode overhead
-
-        if not _skip_offload and offload:
+        if offload:
             offload_transformer(transformer, remove_lora=False)
             offloaded = True
-
+        if humo_image_cond is not None and humo_reference_count > 0:
+            latent = latent[:,:-humo_reference_count]
         vae.to(device)
         videos = vae.decode(latent.unsqueeze(0).to(device, vae.dtype), device=device, tiled=tiled_vae, pbar=False)[0].cpu()
+
         vae.to(offload_device)
 
         sampling_pbar.close()
