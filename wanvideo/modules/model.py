@@ -1000,22 +1000,8 @@ class WanAttentionBlock(nn.Module):
     def ffn_chunked(self, mod_x, num_chunks=4):
         seq_len = mod_x.shape[1]
         if seq_len <= 8192 or num_chunks <= 1:
-            return self._ffn_fused(mod_x)
-        return torch.cat([self._ffn_fused(chunk.contiguous()) for chunk in mod_x.chunk(num_chunks, dim=1)], dim=1)
-
-    def _ffn_fused(self, x):
-        """Fused FFN: bypass nn.Sequential dispatch overhead.
-        Only safe when layers are vanilla nn.Linear (not CustomLinear/LoRA-patched)."""
-        if isinstance(self.ffn, nn.Sequential) and len(self.ffn) == 3:
-            layer0 = self.ffn[0]
-            layer2 = self.ffn[2]
-            # CRITICAL: must be exact nn.Linear, NOT a subclass like CustomLinear
-            # which has custom forward() for fp8, LoRA, scale_weight etc.
-            if type(layer0) is nn.Linear and type(layer2) is nn.Linear:
-                h = F.linear(x, layer0.weight, layer0.bias)
-                h = F.gelu(h, approximate='tanh')
-                return F.linear(h, layer2.weight, layer2.bias)
-        return self.ffn(x)
+            return self.ffn(mod_x)
+        return torch.cat([self.ffn(chunk.contiguous()) for chunk in mod_x.chunk(num_chunks, dim=1)], dim=1)
 
     #region attention forward
     def forward(
