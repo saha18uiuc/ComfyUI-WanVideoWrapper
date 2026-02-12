@@ -1004,13 +1004,14 @@ class WanAttentionBlock(nn.Module):
         return torch.cat([self._ffn_fused(chunk.contiguous()) for chunk in mod_x.chunk(num_chunks, dim=1)], dim=1)
 
     def _ffn_fused(self, x):
-        """Fused FFN: combines Linear+GELU into single F.linear+F.gelu call,
-        avoiding nn.Sequential dispatch overhead and enabling in-place GELU."""
+        """Fused FFN: bypass nn.Sequential dispatch overhead.
+        Only safe when layers are vanilla nn.Linear (not CustomLinear/LoRA-patched)."""
         if isinstance(self.ffn, nn.Sequential) and len(self.ffn) == 3:
             layer0 = self.ffn[0]
             layer2 = self.ffn[2]
-            # Only fuse if both are standard nn.Linear (not replaced by LoRA wrappers etc.)
-            if isinstance(layer0, nn.Linear) and isinstance(layer2, nn.Linear):
+            # CRITICAL: must be exact nn.Linear, NOT a subclass like CustomLinear
+            # which has custom forward() for fp8, LoRA, scale_weight etc.
+            if type(layer0) is nn.Linear and type(layer2) is nn.Linear:
                 h = F.linear(x, layer0.weight, layer0.bias)
                 h = F.gelu(h, approximate='tanh')
                 return F.linear(h, layer2.weight, layer2.bias)
