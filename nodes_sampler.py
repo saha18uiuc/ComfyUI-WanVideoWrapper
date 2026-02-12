@@ -1721,16 +1721,144 @@ class WanVideoSampler:
 
                     #batched
                     else:
-                        base_params['x'] = [z] * 2  # 'x' is the latent input param name
-                        base_params['y'] = [image_cond_input] * 2 if image_cond_input is not None else None
-                        base_params['clip_fea'] = torch.cat([clip_fea, clip_fea], dim=0)
-                        cache_state_uncond = None
-                        # Note: is_uncond is already in base_params (set to False)
-                        [noise_pred_cond, noise_pred_uncond_text], _, cache_state_cond = transformer(
-                            context=positive_embeds + negative_embeds,
-                            pred_id=cache_state[0] if cache_state else None,
-                            **base_params
+                        # Features that require completely separate cond/uncond handling
+                        # (different uncond logic that can't be batched)
+                        has_incompatible_features = (
+                            humo_audio_input is not None
+                            or lynx_embeds is not None
+                            or one_to_all_data is not None
+                            or use_phantom
+                            or latent_model_input_ovi is not None
+                            or pos_latent is not None  # humo
                         )
+                        # For cfg=1.0, batched CFG has nothing to batch (no text uncond pass)
+                        # so fall back to avoid unnecessary overhead
+                        needs_fallback = has_incompatible_features or math.isclose(cfg_scale, 1.0)
+
+                        if needs_fallback:
+                            # Standard 2-pass (or 1-pass for cfg=1.0) CFG
+                            base_params["add_text_emb"] = qwenvl_embeds_pos.to(device) if qwenvl_embeds_pos is not None else None
+                            noise_pred_cond, noise_pred_ovi, cache_state_cond = transformer(
+                                context=positive_embeds,
+                                pred_id=cache_state[0] if cache_state else None,
+                                vace_data=vace_data, attn_cond=attn_cond,
+                                **base_params
+                            )
+                            noise_pred_cond = noise_pred_cond[0]
+                            noise_pred_ovi = noise_pred_ovi[0] if noise_pred_ovi is not None else None
+                            if math.isclose(cfg_scale, 1.0):
+                                if multitalk_audio_input is not None and not math.isclose(audio_cfg_scale[idx], 1.0):
+                                    base_params['multitalk_audio'] = torch.zeros_like(multitalk_audio_input)[-1:]
+                                    noise_pred_uncond_audio, _, cache_state_uncond = transformer(
+                                    context=positive_embeds, pred_id=cache_state[0] if cache_state else None,
+                                    vace_data=vace_data, attn_cond=attn_cond, **base_params)
+                                    return noise_pred_uncond_audio[0] + audio_cfg_scale[idx] * (noise_pred_cond - noise_pred_uncond_audio[0]), noise_pred_ovi, [cache_state_cond, cache_state_uncond]
+                                elif fantasytalking_embeds is not None and not math.isclose(audio_cfg_scale[idx], 1.0):
+                                    base_params['audio_proj'] = None
+                                    noise_pred_uncond_audio, _, cache_state_uncond = transformer(
+                                    context=positive_embeds, pred_id=cache_state[0] if cache_state else None,
+                                    vace_data=vace_data, attn_cond=attn_cond, **base_params)
+                                    return noise_pred_uncond_audio[0] + audio_cfg_scale[idx] * (noise_pred_cond - noise_pred_uncond_audio[0]), noise_pred_ovi, [cache_state_cond, cache_state_uncond]
+                                else:
+                                    return noise_pred_cond, noise_pred_ovi, [cache_state_cond]
+
+                            # unconditional pass
+                            base_params['is_uncond'] = True
+                            base_params['clip_fea'] = clip_fea_neg if clip_fea_neg is not None else clip_fea
+                            base_params["add_text_emb"] = qwenvl_embeds_neg.to(device) if qwenvl_embeds_neg is not None else None
+                            base_params['y'] = [image_cond_neg.to(z)] if image_cond_neg is not None else base_params['y']
+                            if wananim_face_pixels is not None:
+                                base_params['wananim_face_pixel_values'] = torch.zeros_like(wananim_face_pixels).to(device, torch.float32) - 1
+                            if humo_audio_input_neg is not None:
+                                base_params['humo_audio'] = humo_audio_input_neg
+                            if neg_latent is not None:
+                                base_params['x'] = [torch.cat([z[:, :-humo_reference_count], neg_latent], dim=1)]
+                            noise_pred_uncond_text, noise_pred_ovi_uncond, cache_state_uncond = transformer(
+                                context=negative_embeds if humo_audio_input_neg is None else positive_embeds,
+                                pred_id=cache_state[1] if cache_state else None,
+                                vace_data=vace_data, attn_cond=attn_cond_neg,
+                                **base_params)
+                            noise_pred_uncond_text = noise_pred_uncond_text[0]
+                            noise_pred_ovi_uncond = noise_pred_ovi_uncond[0] if noise_pred_ovi_uncond is not None else None
+
+                            # HuMo audio CFG
+                            if not math.isclose(humo_audio_cfg_scale[idx], 1.0):
+                                if cache_state is not None and len(cache_state) != 3:
+                                    cache_state.append(None)
+                                if humo_image_cond is not None and humo_audio_input_neg is not None:
+                                    if t > 980 and humo_image_cond_neg_input is not None:
+                                        base_params['y'] = [humo_image_cond_neg_input]
+                                    noise_pred_humo_audio_uncond, _, cache_state_humo = transformer(
+                                    context=negative_embeds, pred_id=cache_state[2] if cache_state else None, vace_data=None,
+                                    **base_params)
+                                    noise_pred = (noise_pred_uncond_text + humo_audio_cfg_scale[idx] * (noise_pred_cond - noise_pred_humo_audio_uncond[0])
+                                                + (cfg_scale - 2.0) * (noise_pred_humo_audio_uncond[0] - noise_pred_uncond_text))
+                                    return noise_pred, None, [cache_state_cond, cache_state_uncond, cache_state_humo]
+
+                            # audio cfg (fantasytalking and multitalk)
+                            if (fantasytalking_embeds is not None or multitalk_audio_input is not None):
+                                if not math.isclose(audio_cfg_scale[idx], 1.0):
+                                    if cache_state is not None and len(cache_state) != 3:
+                                        cache_state.append(None)
+                                    base_params['audio_proj'] = None
+                                    base_params['multitalk_audio'] = torch.zeros_like(multitalk_audio_input)[-1:] if multitalk_audio_input is not None else None
+                                    base_params['is_uncond'] = False
+                                    noise_pred_uncond_audio, _, cache_state_audio = transformer(
+                                        context=negative_embeds,
+                                        pred_id=cache_state[2] if cache_state else None,
+                                        vace_data=vace_data,
+                                        **base_params)
+                                    noise_pred_uncond_audio = noise_pred_uncond_audio[0]
+                                    noise_pred = noise_pred_uncond_audio + cfg_scale * (
+                                        (noise_pred_cond - noise_pred_uncond_text)
+                                        + audio_cfg_scale[idx] * (noise_pred_uncond_text - noise_pred_uncond_audio))
+                                    return noise_pred, None, [cache_state_cond, cache_state_uncond, cache_state_audio]
+                            # lynx
+                            if lynx_embeds is not None and not math.isclose(lynx_cfg_scale[idx], 1.0):
+                                base_params['is_uncond'] = False
+                                if cache_state is not None and len(cache_state) != 3:
+                                    cache_state.append(None)
+                                noise_pred_lynx, _, cache_state_lynx = transformer(
+                                context=negative_embeds, pred_id=cache_state[2] if cache_state else None, vace_data=None,
+                                **base_params)
+                                noise_pred = (noise_pred_uncond_text + lynx_cfg_scale[idx] * (noise_pred_lynx[0] - noise_pred_uncond_text)
+                                              + cfg_scale * (noise_pred_cond - noise_pred_lynx[0]))
+                                return noise_pred, None, [cache_state_cond, cache_state_uncond, cache_state_lynx]
+                        else:
+                            # True batched CFG - batch cond+uncond in single forward pass
+                            # Saves 1 forward pass per step (~33% fewer passes for 3-pass workflows)
+                            # MultiTalk audio attention handles B>1 by expanding audio embedding
+                            base_params['x'] = [z] * 2
+                            base_params['y'] = [image_cond_input] * 2 if image_cond_input is not None else None
+                            base_params['clip_fea'] = torch.cat([clip_fea, clip_fea], dim=0)
+                            cache_state_uncond = None
+                            [noise_pred_cond, noise_pred_uncond_text], _, cache_state_cond = transformer(
+                                context=positive_embeds + negative_embeds,
+                                pred_id=cache_state[0] if cache_state else None,
+                                **base_params
+                            )
+                            # Audio CFG (3rd pass) for multitalk/fantasytalking with batched text CFG
+                            if (fantasytalking_embeds is not None or multitalk_audio_input is not None):
+                                if not math.isclose(audio_cfg_scale[idx], 1.0):
+                                    if cache_state is not None and len(cache_state) != 3:
+                                        cache_state.append(None)
+                                    # Reset to single-batch for audio uncond pass
+                                    base_params['x'] = [z]
+                                    base_params['y'] = [image_cond_input] if image_cond_input is not None else None
+                                    base_params['clip_fea'] = clip_fea
+                                    base_params['audio_proj'] = None
+                                    base_params['multitalk_audio'] = torch.zeros_like(multitalk_audio_input)[-1:] if multitalk_audio_input is not None else None
+                                    base_params['is_uncond'] = False
+                                    noise_pred_uncond_audio, _, cache_state_audio = transformer(
+                                        context=negative_embeds,
+                                        pred_id=cache_state[2] if cache_state else None,
+                                        vace_data=vace_data,
+                                        **base_params)
+                                    noise_pred_uncond_audio = noise_pred_uncond_audio[0]
+                                    noise_pred = noise_pred_uncond_audio + cfg_scale * (
+                                        (noise_pred_cond - noise_pred_uncond_text)
+                                        + audio_cfg_scale[idx] * (noise_pred_uncond_text - noise_pred_uncond_audio))
+                                    return noise_pred, None, [cache_state_cond, cache_state_uncond, cache_state_audio]
                 except Exception as e:
                     log.error(f"Error during model prediction: {e}")
                     if force_offload:

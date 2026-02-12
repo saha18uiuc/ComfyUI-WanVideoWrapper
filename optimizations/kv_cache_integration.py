@@ -208,11 +208,18 @@ def get_kv_cache_manager() -> Optional[CrossAttnKVCacheManager]:
 
 
 def enable_kv_cache(transformer) -> CrossAttnKVCacheManager:
-    """Enable KV caching on a transformer."""
+    """Enable KV caching on a transformer.
+    
+    NOTE: KV caching is currently disabled due to compatibility issues with
+    WanI2VCrossAttention's varying forward signatures. The hooks added pure
+    Python dispatch overhead (40 layers * N steps) with no caching benefit.
+    This is now a no-op to avoid that overhead.
+    """
     global _kv_cache_manager
     if _kv_cache_manager is None:
         _kv_cache_manager = CrossAttnKVCacheManager()
-    _kv_cache_manager.enable(transformer)
+    # Don't actually hook - it just adds overhead with no benefit currently
+    log.info(f"[KV Cache] KV caching not yet compatible with this model architecture (no-op)")
     return _kv_cache_manager
 
 

@@ -246,6 +246,12 @@ class SingleStreamAttention(nn.Module):
         S = N_h * N_w
         x = x.view(B * N_t, S, self.dim)
 
+        # Handle batched inputs (e.g. batched CFG where B>1):
+        # Audio embedding has N_t entries but we need B*N_t.
+        # Repeat for each batch element (same audio for cond and uncond in text CFG).
+        if encoder_hidden_states.shape[0] != B * N_t and B > 1:
+            encoder_hidden_states = encoder_hidden_states.repeat(B, 1, 1)
+
         # get q for hidden_state
         q = self.q_linear(x).view(B * N_t, S, self.num_heads, self.head_dim)
         
@@ -320,12 +326,24 @@ class SingleStreamMultiAttention(SingleStreamAttention):
             return super().forward(x, encoder_hidden_states, shape)
 
         N_t, N_h, N_w = shape
+        B_orig = x.shape[0]  # batch dim (>1 for batched CFG)
         
         x_extra = None
-        if x.shape[0] * N_t != encoder_hidden_states.shape[0]:
-            x_extra = x[:, -N_h * N_w:, :]
-            x = x[:, :-N_h * N_w, :]
-            N_t = N_t - 1
+        if B_orig * N_t != encoder_hidden_states.shape[0]:
+            # Could be extra tokens OR batch mismatch - check both
+            expected_with_extra = B_orig * (N_t - 1)
+            if encoder_hidden_states.shape[0] == N_t or encoder_hidden_states.shape[0] == N_t - 1:
+                # Batch>1 but audio has batch=1: expand audio for batched CFG
+                if B_orig > 1:
+                    encoder_hidden_states = encoder_hidden_states.repeat(B_orig, 1, 1)
+                if B_orig * N_t != encoder_hidden_states.shape[0]:
+                    x_extra = x[:, -N_h * N_w:, :]
+                    x = x[:, :-N_h * N_w, :]
+                    N_t = N_t - 1
+            else:
+                x_extra = x[:, -N_h * N_w:, :]
+                x = x[:, :-N_h * N_w, :]
+                N_t = N_t - 1
         x = rearrange(x, "B (N_t S) C -> (B N_t) S C", N_t=N_t)
 
         # Query projection

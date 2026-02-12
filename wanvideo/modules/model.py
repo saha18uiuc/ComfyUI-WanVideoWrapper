@@ -2921,36 +2921,53 @@ class WanModel(torch.nn.Module):
 
         # MultiTalk
         if multitalk_audio is not None:
-            self.multitalk_audio_proj.to(self.main_device)
-            audio_cond = multitalk_audio.to(device=x.device, dtype=self.base_dtype)
-            first_frame_audio_emb_s = audio_cond[:, :1, ...] 
-            latter_frame_audio_emb = audio_cond[:, 1:, ...] 
-            latter_frame_audio_emb = rearrange(latter_frame_audio_emb, "b (n_t n) w s c -> b n_t n w s c", n=4) 
-            middle_index = self.multitalk_audio_proj.seq_len // 2
-            latter_first_frame_audio_emb = latter_frame_audio_emb[:, :, :1, :middle_index+1, ...] 
-            latter_first_frame_audio_emb = rearrange(latter_first_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c") 
-            latter_last_frame_audio_emb = latter_frame_audio_emb[:, :, -1:, middle_index:, ...] 
-            latter_last_frame_audio_emb = rearrange(latter_last_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c") 
-            latter_middle_frame_audio_emb = latter_frame_audio_emb[:, :, 1:-1, middle_index:middle_index+1, ...] 
-            latter_middle_frame_audio_emb = rearrange(latter_middle_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c") 
-            latter_frame_audio_emb_s = torch.concat([latter_first_frame_audio_emb, latter_middle_frame_audio_emb, latter_last_frame_audio_emb], dim=2) 
-            multitalk_audio_embedding = self.multitalk_audio_proj(first_frame_audio_emb_s, latter_frame_audio_emb_s)
-            self.multitalk_audio_proj.to(self.offload_device)
-            human_num = len(multitalk_audio_embedding)
+            # Cache audio embedding: same audio produces same embedding across timesteps.
+            # Avoids redundant audio_proj computation + GPU<->CPU weight transfers.
+            _mt_cache = getattr(self, '_multitalk_emb_cache', None)
+            _cache_hit = False
+            if _mt_cache is not None:
+                cached_ptr, cached_shape, cached_emb, cached_human = _mt_cache
+                if cached_ptr == multitalk_audio.data_ptr() and cached_shape == multitalk_audio.shape:
+                    multitalk_audio_embedding = cached_emb
+                    human_num = cached_human
+                    _cache_hit = True
 
-            # LongCat-Avatar specific
-            if longcat_num_ref_latents > 0:
-                audio_start_ref = multitalk_audio_embedding[:, [0], :, :] # padding
-                multitalk_audio_embedding = torch.cat([audio_start_ref, multitalk_audio_embedding], dim=1).contiguous()
+            if not _cache_hit:
+                self.multitalk_audio_proj.to(self.main_device)
+                audio_cond = multitalk_audio.to(device=x.device, dtype=self.base_dtype)
+                first_frame_audio_emb_s = audio_cond[:, :1, ...] 
+                latter_frame_audio_emb = audio_cond[:, 1:, ...] 
+                latter_frame_audio_emb = rearrange(latter_frame_audio_emb, "b (n_t n) w s c -> b n_t n w s c", n=4) 
+                middle_index = self.multitalk_audio_proj.seq_len // 2
+                latter_first_frame_audio_emb = latter_frame_audio_emb[:, :, :1, :middle_index+1, ...] 
+                latter_first_frame_audio_emb = rearrange(latter_first_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c") 
+                latter_last_frame_audio_emb = latter_frame_audio_emb[:, :, -1:, middle_index:, ...] 
+                latter_last_frame_audio_emb = rearrange(latter_last_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c") 
+                latter_middle_frame_audio_emb = latter_frame_audio_emb[:, :, 1:-1, middle_index:middle_index+1, ...] 
+                latter_middle_frame_audio_emb = rearrange(latter_middle_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c") 
+                latter_frame_audio_emb_s = torch.concat([latter_first_frame_audio_emb, latter_middle_frame_audio_emb, latter_last_frame_audio_emb], dim=2) 
+                multitalk_audio_embedding = self.multitalk_audio_proj(first_frame_audio_emb_s, latter_frame_audio_emb_s)
+                self.multitalk_audio_proj.to(self.offload_device)
+                human_num = len(multitalk_audio_embedding)
 
-            if longcat_num_cond_latents > 0:
-                multitalk_audio_embedding = multitalk_audio_embedding[:, (-F // self.patch_size[0]):]
+            if not _cache_hit:
+                # Post-process and cache the result
+                # LongCat-Avatar specific
+                if longcat_num_ref_latents > 0:
+                    audio_start_ref = multitalk_audio_embedding[:, [0], :, :] # padding
+                    multitalk_audio_embedding = torch.cat([audio_start_ref, multitalk_audio_embedding], dim=1).contiguous()
 
-            if ref_target_masks is not None:
-                multitalk_audio_embedding = torch.concat(multitalk_audio_embedding.split(1), dim=2).to(self.base_dtype)
-                multitalk_audio_embedding = multitalk_audio_embedding.squeeze(0)
-            else:
-                multitalk_audio_embedding = rearrange(multitalk_audio_embedding, "b t n c -> (b t) n c")
+                if longcat_num_cond_latents > 0:
+                    multitalk_audio_embedding = multitalk_audio_embedding[:, (-F // self.patch_size[0]):]
+
+                if ref_target_masks is not None:
+                    multitalk_audio_embedding = torch.concat(multitalk_audio_embedding.split(1), dim=2).to(self.base_dtype)
+                    multitalk_audio_embedding = multitalk_audio_embedding.squeeze(0)
+                else:
+                    multitalk_audio_embedding = rearrange(multitalk_audio_embedding, "b t n c -> (b t) n c")
+
+                # Cache for reuse across timesteps (same audio = same embedding)
+                self._multitalk_emb_cache = (multitalk_audio.data_ptr(), multitalk_audio.shape, multitalk_audio_embedding, human_num)
 
 
         # convert ref_target_masks to token_ref_target_masks

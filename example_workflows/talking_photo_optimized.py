@@ -1,5 +1,4 @@
 # --- OPTIMIZED TALKING PHOTO with Zero-Overhead Speedups ---
-# Based on research: SmoothCache (CVPR 2025), dKV-Cache
 # All optimizations have ZERO cold-start cost
 
 import os
@@ -8,10 +7,22 @@ import subprocess
 import time
 from pathlib import Path
 
-# Memory optimization
+# =============================================================================
+# MEMORY OPTIMIZATIONS (zero-cost, always beneficial)
+# =============================================================================
+# 1. expandable_segments: Reduces fragmentation by growing existing allocations
+# 2. garbage_collection_threshold: Delays GC until 80% of reserved is used
 alloc_conf = "expandable_segments:True,garbage_collection_threshold:0.8"
 os.environ["PYTORCH_ALLOC_CONF"] = alloc_conf
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = alloc_conf
+
+# 3. CUBLAS workspace size: Larger workspace lets cuBLAS pick faster algorithms
+#    for the 5120-dim matmuls in WanVideo's 14B transformer
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+
+# 4. Disable Python GC during inference (manual GC at window boundaries)
+#    Prevents random GC pauses during GPU-bound computation
+os.environ["DISABLE_GC_DURING_INFERENCE"] = "1"
 
 # Paths
 WORKFLOW_PATH = Path("/content/workflow_api.py")
@@ -42,25 +53,19 @@ os.environ["WAN_LORA_TIMING"] = "1"
 # 1. BATCHED_CFG: Batch conditional + unconditional in single forward pass
 #    How: Instead of 2 separate forwards (batch=1 each), do 1 forward (batch=2)
 #    Why fast: Better GPU utilization, less kernel launch overhead
-#    Speedup: ~10-15%
+#    Speedup: ~10-15% for t2v/i2v workflows
 #    Quality: EXACT (same math, different batching)
+#    NOTE: Auto-falls back to 2-pass for multitalk/audio workflows (incompatible
+#    audio features require separate passes). Still set it - it works for the
+#    non-audio CFG passes in the pipeline.
 os.environ["BATCHED_CFG"] = "1"
 
-# 2. KV_CACHE: Cache K/V projections for cross-attention
-#    How: Text/image conditioning is STATIC across timesteps
-#         Compute K=W_k@context, V=W_v@context ONCE, reuse for all timesteps
-#    Why fast: Saves 4 matrix multiplications per layer per timestep
-#              For 40 layers × 3 timesteps = 480 saved matmuls!
-#    Speedup: ~15-25% on cross-attention heavy workloads
-#    Quality: EXACT (same computation, just cached)
-os.environ["KV_CACHE"] = "1"
-
 # =============================================================================
-# DISABLED: These have cold-start costs
+# DISABLED: These don't help for this workflow
 # =============================================================================
+# KV_CACHE: Not yet compatible with WanI2V cross-attention architecture
 # TORCH_COMPILE: 30-60s compilation - NOT worth it for single runs
-# SMOOTH_CACHE: Layer output caching - slight overhead for setup
-# FUSED_KERNELS: Triton compilation - takes time to compile
+# SMOOTH_CACHE: Layer output caching - needs per-model calibration
 
 # =============================================================================
 # MODELS
@@ -94,11 +99,16 @@ print("=" * 70)
 print(f"{DURATION_S}s @ {FPS}fps = {MAX_FRAMES} frames, 512x512, 3 steps")
 print()
 print("Active Zero-Overhead Optimizations:")
-print("  [x] BATCHED_CFG  - Batch cond+uncond forward (~10-15%)")
-print("  [x] KV_CACHE     - Cache cross-attention K/V (~15-25%)")
+print("  [x] BATCHED_CFG        - Batch text cond+uncond (saves 1 pass when cfg>1)")
+print("  [x] AUDIO_EMB_CACHE    - Cache audio projection across timesteps")
+print("  [x] MEMORY_ALLOC       - expandable_segments + high GC threshold")
+print("  [x] CUBLAS_WORKSPACE   - Larger workspace for faster matmul algorithms")
+print("  [x] GC_DISABLE         - No GC pauses during GPU-bound sampling")
+print("  [x] INPLACE_OPS        - Reduced tensor copies in hot loops")
+print("  [x] REDUNDANT_TO_ELIM  - Eliminated redundant .to(device) calls")
 print()
-print("Combined expected: ~25-35% speedup")
-print("Expected: ~4.5-5.0 min (vs ~6.4 min baseline)")
+print("Audio embedding cache saves ~67% of audio_proj GPU transfers")
+print("For cfg>1.0: BATCHED_CFG saves 33% of forward passes")
 print("=" * 70)
 
 # Pull latest optimizations

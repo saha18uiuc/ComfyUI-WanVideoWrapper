@@ -259,8 +259,8 @@ def multitalk_loop(self, **kwargs):
 
         # injecting motion frames
         if not is_first_clip and mode == "multitalk":
-            latent_motion_frames = latent_motion_frames.to(latent.dtype).to(device)
-            motion_add_noise = torch.randn(latent_motion_frames.shape, device=torch.device("cpu"), generator=seed_g).to(device).contiguous()
+            latent_motion_frames = latent_motion_frames.to(device=device, dtype=latent.dtype)
+            motion_add_noise = torch.randn(latent_motion_frames.shape, device=torch.device("cpu"), generator=seed_g).to(device)
             add_latent = add_noise(latent_motion_frames, motion_add_noise, timesteps[0])
             latent[:, :add_latent.shape[1]] = add_latent
 
@@ -327,11 +327,15 @@ def multitalk_loop(self, **kwargs):
 
         mm.soft_empty_cache()
         gc.collect()
+        # Disable GC during sampling loop to prevent random pauses
+        # (GPU-bound loop, GC pauses hurt throughput)
+        _gc_was_enabled = gc.isenabled()
+        gc.disable()
         # sampling loop
         sampling_pbar = tqdm(total=len(timesteps)-1, desc=f"Sampling audio indices {audio_start_idx}-{audio_end_idx}", position=0, leave=True)
         for i in range(len(timesteps)-1):
             timestep = timesteps[i]
-            latent_model_input = latent.to(device)
+            latent_model_input = latent if latent.device == device else latent.to(device)
             if mode == "infinitetalk":
                 if humo_image_cond is None or not is_first_clip:
                     latent_model_input[:, :cur_motion_frames_latent_num] = latent_motion_frames
@@ -344,7 +348,7 @@ def multitalk_loop(self, **kwargs):
                 uni3c_data = uni3c_data)
 
             if callback is not None:
-                callback_latent = (latent_model_input.to(device) - noise_pred.to(device) * timestep.to(device) / 1000).detach().permute(1,0,2,3)
+                callback_latent = (latent_model_input - noise_pred * timestep / 1000).detach().permute(1,0,2,3)
                 callback(step_iteration_count, callback_latent, None, estimated_iterations*(len(timesteps)-1))
                 del callback_latent
 
@@ -365,20 +369,23 @@ def multitalk_loop(self, **kwargs):
             # differential diffusion inpaint
             if masks is not None:
                 if i < len(timesteps) - 1:
-                    image_latent = add_noise(original_image.to(device), noise.to(device), timesteps[i+1])
+                    image_latent = add_noise(original_image, noise, timesteps[i+1])
                     mask = masks[i].to(latent)
                     latent = image_latent * mask + latent * (1-mask)
 
             # injecting motion frames
             if not is_first_clip and mode == "multitalk":
-                latent_motion_frames = latent_motion_frames.to(latent.dtype).to(device)
-                motion_add_noise = torch.randn(latent_motion_frames.shape, device=torch.device("cpu"), generator=seed_g).to(device).contiguous()
+                latent_motion_frames = latent_motion_frames.to(device=device, dtype=latent.dtype)
+                motion_add_noise = torch.randn(latent_motion_frames.shape, device=torch.device("cpu"), generator=seed_g).to(device)
                 add_latent = add_noise(latent_motion_frames, motion_add_noise, timesteps[i+1])
                 latent[:, :add_latent.shape[1]] = add_latent
             else:
                 if humo_image_cond is None or not is_first_clip:
                     latent[:, :cur_motion_frames_latent_num] = latent_motion_frames
 
+        # Re-enable GC after sampling loop
+        if _gc_was_enabled:
+            gc.enable()
         del noise, latent_motion_frames
         if offload:
             offload_transformer(transformer, remove_lora=False)
