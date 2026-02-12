@@ -139,14 +139,13 @@ def multitalk_loop(self, **kwargs):
         latent_frame_num = (frame_num - 1) // 4 + 1
 
         # Generate noise on CPU (for reproducibility with seed_g) then async transfer
-        # Using pin_memory + non_blocking for overlapped CPU->GPU transfer
         _noise_cpu = torch.randn(
             16, latent_frame_num,
             lat_h, lat_w, dtype=torch.float32, device=torch.device("cpu"), generator=seed_g)
-        if _noise_cpu.is_pinned():
-            noise = _noise_cpu.to(device, non_blocking=True)
-        else:
+        try:
             noise = _noise_cpu.pin_memory().to(device, non_blocking=True)
+        except Exception:
+            noise = _noise_cpu.to(device)
 
         # Calculate the correct latent slice based on current iteration
         if is_first_clip:
@@ -266,7 +265,10 @@ def multitalk_loop(self, **kwargs):
         if not is_first_clip and mode == "multitalk":
             latent_motion_frames = latent_motion_frames.to(device=device, dtype=latent.dtype)
             _mn = torch.randn(latent_motion_frames.shape, device=torch.device("cpu"), generator=seed_g)
-            motion_add_noise = _mn.pin_memory().to(device, non_blocking=True) if not _mn.is_pinned() else _mn.to(device, non_blocking=True)
+            try:
+                motion_add_noise = _mn.pin_memory().to(device, non_blocking=True)
+            except Exception:
+                motion_add_noise = _mn.to(device)
             add_latent = add_noise(latent_motion_frames, motion_add_noise, timesteps[0])
             latent[:, :add_latent.shape[1]] = add_latent
 
@@ -333,9 +335,6 @@ def multitalk_loop(self, **kwargs):
 
         mm.soft_empty_cache()
         gc.collect()
-        # Pre-warm CUDA allocator: consolidate memory before the tight loop
-        # so the caching allocator reaches steady state faster (no fragmentation splits)
-        torch.cuda.empty_cache()
         # Disable GC during sampling loop to prevent random pauses
         # (GPU-bound loop, GC pauses hurt throughput)
         _gc_was_enabled = gc.isenabled()
@@ -386,7 +385,10 @@ def multitalk_loop(self, **kwargs):
             if not is_first_clip and mode == "multitalk":
                 latent_motion_frames = latent_motion_frames.to(device=device, dtype=latent.dtype)
                 _mn2 = torch.randn(latent_motion_frames.shape, device=torch.device("cpu"), generator=seed_g)
-                motion_add_noise = _mn2.pin_memory().to(device, non_blocking=True) if not _mn2.is_pinned() else _mn2.to(device, non_blocking=True)
+                try:
+                    motion_add_noise = _mn2.pin_memory().to(device, non_blocking=True)
+                except Exception:
+                    motion_add_noise = _mn2.to(device)
                 add_latent = add_noise(latent_motion_frames, motion_add_noise, timesteps[i+1])
                 latent[:, :add_latent.shape[1]] = add_latent
             else:
@@ -397,15 +399,24 @@ def multitalk_loop(self, **kwargs):
         if _gc_was_enabled:
             gc.enable()
         del noise, latent_motion_frames
-        # Skip transformer offload between windows - keep both transformer + VAE on GPU
-        # to avoid the costly offload/reload cycle (~2-5s per window).
-        # Only offload at the very end (handled after the while loop).
         if humo_image_cond is not None and humo_reference_count > 0:
             latent = latent[:,:-humo_reference_count]
-        if not hasattr(vae, '_on_device') or not vae._on_device:
-            vae.to(device)
-            vae._on_device = True
+
+        # Optimization: try to skip transformer offload between windows.
+        # Check if we have enough free VRAM to keep transformer + run VAE decode.
+        # VAE decode needs ~1-2GB extra. If not enough, fall back to offload.
+        _skip_offload = False
+        if torch.cuda.is_available():
+            _free_mem = torch.cuda.mem_get_info(device)[0] / (1024**3)  # free VRAM in GB
+            _skip_offload = _free_mem > 2.0  # Need ~2GB for VAE decode overhead
+
+        if not _skip_offload and offload:
+            offload_transformer(transformer, remove_lora=False)
+            offloaded = True
+
+        vae.to(device)
         videos = vae.decode(latent.unsqueeze(0).to(device, vae.dtype), device=device, tiled=tiled_vae, pbar=False)[0].cpu()
+        vae.to(offload_device)
 
         sampling_pbar.close()
 
@@ -489,10 +500,6 @@ def multitalk_loop(self, **kwargs):
     else:
         gen_video_samples = torch.zeros(3, 1, 64, 64) # dummy output
 
-    # Final cleanup: offload VAE and transformer
-    if hasattr(vae, '_on_device') and vae._on_device:
-        vae.to(offload_device)
-        vae._on_device = False
     if force_offload:
         if not model["auto_cpu_offload"]:
             offload_transformer(transformer)

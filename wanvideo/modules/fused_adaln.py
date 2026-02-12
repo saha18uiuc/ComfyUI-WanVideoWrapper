@@ -42,8 +42,12 @@ if _HAS_TRITON:
         x = tl.load(X_ptr + x_offset + col_offsets, mask=mask, other=0.0).to(tl.float32)
         
         # LayerNorm: (x - mean) / sqrt(var + eps)
+        # Note: masked elements are 0, divide by N (not BLOCK_N) for correct mean
         mean = tl.sum(x, axis=0) / N
         x_centered = x - mean
+        # Zero out masked elements before variance computation to avoid
+        # masked positions contributing (-mean)^2 to the variance
+        x_centered = tl.where(mask, x_centered, 0.0)
         var = tl.sum(x_centered * x_centered, axis=0) / N
         rstd = 1.0 / tl.sqrt(var + eps)
         x_norm = x_centered * rstd
@@ -55,11 +59,11 @@ if _HAS_TRITON:
         # AdaLN modulation: x_norm * (1 + scale) + shift
         out = x_norm * (1.0 + scale) + shift
         
-        # Store in original dtype
+        # Store - Triton auto-casts fp32 to output tensor's dtype (bf16/fp16)
         tl.store(Out_ptr + x_offset + col_offsets, out, mask=mask)
 
 
-def fused_adaln_rmsnorm(x, norm_weight, shift, scale, eps=1e-6):
+def fused_adaln_layernorm(x, shift, scale, eps=1e-6):
     """Fused LayerNorm (no affine) + AdaLN modulation.
     
     Computes: LayerNorm(x) * (1 + scale) + shift
@@ -70,7 +74,6 @@ def fused_adaln_rmsnorm(x, norm_weight, shift, scale, eps=1e-6):
     
     Args:
         x: Input tensor [B, L, N]
-        norm_weight: Unused (kept for API compatibility). WanLayerNorm has no affine params.
         shift: Shift tensor broadcastable to [B, L, N]
         scale: Scale tensor broadcastable to [B, L, N]
         eps: Epsilon for LayerNorm

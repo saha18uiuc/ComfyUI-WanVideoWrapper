@@ -26,7 +26,7 @@ from ...custom_linear import update_lora_step
 
 from ...MTV.mtv import apply_rotary_emb
 try:
-    from .fused_adaln import fused_adaln_rmsnorm, _HAS_TRITON as _HAS_FUSED_ADALN
+    from .fused_adaln import fused_adaln_layernorm, _HAS_TRITON as _HAS_FUSED_ADALN
 except ImportError:
     _HAS_FUSED_ADALN = False
 from comfy.ldm.flux.math import apply_rope1 as apply_rope_comfy1
@@ -1007,10 +1007,13 @@ class WanAttentionBlock(nn.Module):
         """Fused FFN: combines Linear+GELU into single F.linear+F.gelu call,
         avoiding nn.Sequential dispatch overhead and enabling in-place GELU."""
         if isinstance(self.ffn, nn.Sequential) and len(self.ffn) == 3:
-            # Standard FFN: Linear -> GELU -> Linear
-            h = F.linear(x, self.ffn[0].weight, self.ffn[0].bias)
-            h = F.gelu(h, approximate='tanh')
-            return F.linear(h, self.ffn[2].weight, self.ffn[2].bias)
+            layer0 = self.ffn[0]
+            layer2 = self.ffn[2]
+            # Only fuse if both are standard nn.Linear (not replaced by LoRA wrappers etc.)
+            if isinstance(layer0, nn.Linear) and isinstance(layer2, nn.Linear):
+                h = F.linear(x, layer0.weight, layer0.bias)
+                h = F.gelu(h, approximate='tanh')
+                return F.linear(h, layer2.weight, layer2.bias)
         return self.ffn(x)
 
     #region attention forward
@@ -1084,8 +1087,8 @@ class WanAttentionBlock(nn.Module):
             ], dim=1).to(input_dtype)
         else:
             if _HAS_FUSED_ADALN and x.is_cuda and self.seg_idx is None:
-                # Fused AdaLN: RMSNorm + shift + scale in single kernel
-                input_x = fused_adaln_rmsnorm(x, self.norm1.weight, shift_msa, scale_msa, eps=self.norm1.eps)
+                # Fused AdaLN: LayerNorm + shift + scale in single kernel
+                input_x = fused_adaln_layernorm(x, shift_msa, scale_msa, eps=self.norm1.eps)
                 if input_x.dtype != input_dtype:
                     input_x = input_x.to(input_dtype)
             else:
