@@ -6,7 +6,7 @@ from comfy.ldm.modules.attention import optimized_attention
 def attention_func_error(*args, **kwargs):
     raise ImportError("Selected attention mode not available. Please ensure required packages are installed correctly.")
 
-from .attention_flash import flash_attention
+from .attention_flash import flash_attention, FLASH_ATTN_2_AVAILABLE, FLASH_ATTN_3_AVAILABLE
 
 # Sage Attention imports
 # using custom ops to avoid graph breaks with torch.compile
@@ -115,3 +115,56 @@ def attention(q, k, v, q_lens=None, k_lens=None, max_seqlen_q=None, max_seqlen_k
         if not (q.dtype == k.dtype == v.dtype):
             return torch.nn.functional.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2).to(q.dtype), v.transpose(1, 2).to(q.dtype), attn_mask=attn_mask).transpose(1, 2).contiguous()
         return torch.nn.functional.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), attn_mask=attn_mask).transpose(1, 2).contiguous()
+
+
+def get_available_attention_modes():
+    """Return a map of attention mode -> availability."""
+    def _avail(fn):
+        return fn is not attention_func_error
+
+    return {
+        "sdpa": True,
+        "flash_attn_2": bool(FLASH_ATTN_2_AVAILABLE),
+        "flash_attn_3": bool(FLASH_ATTN_3_AVAILABLE),
+        "sageattn": _avail(sageattn_func),
+        "sageattn_3": _avail(sageattn_blackwell),
+        "sageattn_compiled": "sageattn_func_compiled" in globals(),
+        "sageattn_varlen": _avail(sageattn_varlen_func),
+        "sageattn_ultravico": _avail(sageattn_func_ultravico),
+        # These are supported behavior modes but not preferred fast-path kernels.
+        "comfy": True,
+        "radial_sage_attention": True,
+    }
+
+
+def resolve_attention_mode(requested_mode="sdpa", hard_gate=True, disallow_comfy=True):
+    """
+    Resolve attention mode with deterministic fast-path preference.
+    Preference order (exact attention math): sageattn -> flash3 -> flash2 -> sdpa.
+    """
+    available = get_available_attention_modes()
+    preferred = ["sageattn", "flash_attn_3", "flash_attn_2", "sdpa"]
+
+    req = requested_mode or "sdpa"
+    if req == "auto":
+        for mode in preferred:
+            if available.get(mode, False):
+                return mode
+        return "sdpa"
+
+    if req == "comfy" and disallow_comfy:
+        for mode in preferred:
+            if available.get(mode, False):
+                return mode
+        return "sdpa"
+
+    if available.get(req, False):
+        return req
+
+    if hard_gate:
+        raise ValueError(f"Requested attention mode '{req}' is not available on this environment.")
+
+    for mode in preferred:
+        if available.get(mode, False):
+            return mode
+    return "sdpa"

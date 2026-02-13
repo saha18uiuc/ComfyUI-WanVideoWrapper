@@ -7,6 +7,7 @@ from tqdm import tqdm
 import re
 
 from .wanvideo.modules.model import WanModel, LoRALinearLayer, WanRMSNorm
+from .wanvideo.modules.attention import resolve_attention_mode, get_available_attention_modes
 from .wanvideo.modules.t5 import T5EncoderModel
 from .wanvideo.modules.clip import CLIPModel
 from .wanvideo.wan_video_vae import WanVideoVAE, WanVideoVAE38
@@ -36,7 +37,7 @@ try:
 except:
     PromptServer = None
 
-attention_modes = ["sdpa", "flash_attn_2", "flash_attn_3", "sageattn", "sageattn_3", "radial_sage_attention", "sageattn_compiled",
+attention_modes = ["auto", "sdpa", "flash_attn_2", "flash_attn_3", "sageattn", "sageattn_3", "radial_sage_attention", "sageattn_compiled",
                     "sageattn_ultravico", "comfy"]
 
 #from city96's gguf nodes
@@ -1050,8 +1051,14 @@ class WanVideoSetAttentionModeOverride:
 
     def getmodelpath(self, model, attention_mode, start_step, end_step, verbose, blocks=None):
         model_clone = model.clone()
+        hard_attention_gate = os.environ.get("WAN_ATTENTION_HARD_GATE", "1") == "1"
+        resolved_mode = resolve_attention_mode(
+            requested_mode=attention_mode,
+            hard_gate=hard_attention_gate,
+            disallow_comfy=hard_attention_gate,
+        )
         attention_mode_override = {
-            "mode": attention_mode,
+            "mode": resolved_mode,
             "start_step": start_step,
             "end_step": end_step,
             "verbose": verbose,
@@ -1059,6 +1066,8 @@ class WanVideoSetAttentionModeOverride:
         if blocks is not None:
             attention_mode_override["blocks"] = blocks
         model_clone.model_options['transformer_options']["attention_mode_override"] = attention_mode_override
+        if resolved_mode != attention_mode:
+            log.warning(f"[Speed Opt] Attention override '{attention_mode}' remapped to '{resolved_mode}' by hard-gate policy")
 
         return (model_clone,)
 
@@ -1133,6 +1142,16 @@ class WanVideoModelLoader:
         mm.unload_all_models()
         mm.cleanup_models()
         mm.soft_empty_cache()
+
+        hard_attention_gate = os.environ.get("WAN_ATTENTION_HARD_GATE", "1") == "1"
+        if attention_mode == "comfy" and hard_attention_gate:
+            log.warning("[Speed Opt] Attention hard-gate enabled; replacing 'comfy' with fastest available exact kernel.")
+        attention_mode = resolve_attention_mode(
+            requested_mode=attention_mode,
+            hard_gate=hard_attention_gate,
+            disallow_comfy=hard_attention_gate,
+        )
+        log.info(f"[Speed Opt] Attention mode resolved to '{attention_mode}' (hard_gate={hard_attention_gate}, available={get_available_attention_modes()})")
 
         if "sage" in attention_mode:
             try:

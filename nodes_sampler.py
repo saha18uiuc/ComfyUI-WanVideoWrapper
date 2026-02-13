@@ -1,4 +1,4 @@
-import os, gc, math, copy
+import os, gc, math, copy, time
 import torch
 import numpy as np
 from tqdm import tqdm
@@ -146,6 +146,7 @@ class WanVideoSampler:
         # ============================================================================
         
         # Check if ANY optimization is requested
+        allow_legacy_opts = os.environ.get("WAN_ALLOW_LEGACY_OPT", "0") == "1"
         any_opt = any([
             os.environ.get("BATCHED_CFG", "0") == "1",
             os.environ.get("KV_CACHE", "0") == "1",
@@ -166,32 +167,72 @@ class WanVideoSampler:
         #    Saves 4 matrix multiplications per layer per timestep after first
         kv_cache_enabled = os.environ.get("KV_CACHE", "0") == "1"
         if kv_cache_enabled:
-            try:
-                from .optimizations.kv_cache_integration import enable_kv_cache
-                enable_kv_cache(transformer)
-                log.info("[Speed Opt] KV_CACHE=1: Cross-attention KV caching (EXACT, ~15-25% faster)")
-            except Exception as e:
-                log.warning(f"[Speed Opt] KV_CACHE failed to enable: {e}")
+            if hasattr(transformer, "clear_runtime_caches"):
+                # WanModel now includes native cross-attention K/V caching.
+                log.info("[Speed Opt] KV_CACHE=1: Using native WanModel cross-attention cache path")
+            else:
+                log.warning("[Speed Opt] KV_CACHE requested but transformer has no native runtime cache hooks")
         
         # 3. TORCH_COMPILE: PyTorch graph compiler
         #    WARNING: Has ~30-60s cold-start compilation time!
         #    Only enable for REPEATED runs where compilation cost is amortized
         force_compile = os.environ.get("TORCH_COMPILE", "0") == "1"
         if force_compile:
-            log.warning("[Speed Opt] TORCH_COMPILE=1: WARNING - First run SLOWER due to compilation!")
-            log.warning("[Speed Opt] Compilation adds ~30-60s. Subsequent runs ~15-30% faster.")
-            if model["compile_args"] is None:
-                default_compile_args = {
-                    "backend": "inductor",
-                    "fullgraph": False,
-                    "mode": "reduce-overhead",  
-                    "dynamic": False,
-                    "dynamo_cache_size_limit": 64,
-                    "compile_transformer_blocks_only": True,
-                    "force_parameter_static_shapes": True,
-                    "dynamo_recompile_limit": 128,
-                }
-                model["compile_args"] = default_compile_args
+            if not allow_legacy_opts:
+                log.warning("[Speed Opt] TORCH_COMPILE ignored (legacy opt disabled by validated fast path). Set WAN_ALLOW_LEGACY_OPT=1 to override.")
+                force_compile = False
+            else:
+                log.warning("[Speed Opt] TORCH_COMPILE=1: WARNING - First run SLOWER due to compilation!")
+                log.warning("[Speed Opt] Compilation adds ~30-60s. Subsequent runs ~15-30% faster.")
+                if model["compile_args"] is None:
+                    default_compile_args = {
+                        "backend": "inductor",
+                        "fullgraph": False,
+                        "mode": "reduce-overhead",
+                        "dynamic": False,
+                        "dynamo_cache_size_limit": 64,
+                        "compile_transformer_blocks_only": True,
+                        "force_parameter_static_shapes": True,
+                        "dynamo_recompile_limit": 128,
+                    }
+                    model["compile_args"] = default_compile_args
+
+        cache_stats_logged = False
+        speed_report_logged = False
+        speed_report_enabled = os.environ.get("WAN_SPEED_REPORT", "1") == "1"
+        run_start_t = time.perf_counter()
+        speed_metrics = {"prep": 0.0, "denoise": 0.0, "decode": 0.0}
+
+        def _mark_denoise_start():
+            if speed_metrics["prep"] == 0.0:
+                speed_metrics["prep"] = max(0.0, time.perf_counter() - run_start_t)
+            return time.perf_counter()
+
+        def _log_cache_stats_once():
+            nonlocal cache_stats_logged
+            if cache_stats_logged:
+                return
+            if hasattr(transformer, "log_runtime_cache_stats"):
+                transformer.log_runtime_cache_stats()
+                cache_stats_logged = True
+
+        def _log_speed_report_once(tag=""):
+            nonlocal speed_report_logged
+            if speed_report_logged or not speed_report_enabled:
+                return
+            total_t = max(0.0, time.perf_counter() - run_start_t)
+            prep_t = speed_metrics["prep"]
+            denoise_t = speed_metrics["denoise"]
+            decode_t = speed_metrics["decode"]
+            if prep_t == 0.0:
+                prep_t = max(0.0, total_t - denoise_t - decode_t)
+            finalize_t = max(0.0, total_t - prep_t - denoise_t - decode_t)
+            log.info(
+                f"[Speed Opt] Speed report{tag}: "
+                f"prep={prep_t:.3f}s, denoise={denoise_t:.3f}s, decode={decode_t:.3f}s, "
+                f"finalize={finalize_t:.3f}s, total={total_t:.3f}s"
+            )
+            speed_report_logged = True
         
         # Only compile if not using auto_cpu_offload OR if force_compile is set
         if model["auto_cpu_offload"] is False or force_compile:
@@ -1930,6 +1971,10 @@ class WanVideoSampler:
         #clear memory before sampling
         mm.soft_empty_cache()
         gc.collect()
+        if hasattr(transformer, "clear_runtime_caches"):
+            transformer.clear_runtime_caches(clear_cross_attn=True)
+            if hasattr(transformer, "reset_runtime_cache_stats"):
+                transformer.reset_runtime_cache_stats()
         try:
             torch.cuda.reset_peak_memory_stats(device)
         except:
@@ -1994,6 +2039,7 @@ class WanVideoSampler:
             try:
                 pbar = ProgressBar(len(timesteps) - ttm_start_step)
                 #region main loop start
+                denoise_t0 = _mark_denoise_start()
                 for idx, t in enumerate(tqdm(timesteps[ttm_start_step:], disable=multitalk_sampling or wananimate_loop)):
 
                     if bidirectional_sampling:
@@ -2332,6 +2378,7 @@ class WanVideoSampler:
                                 sample_scheduler, timesteps,_,_ = get_scheduler(scheduler, total_steps, start_step, end_step, shift, device, transformer.dim, denoise_strength, sigmas=sigmas)
 
                             latent = noise.to(device)
+                            framepack_denoise_t0 = _mark_denoise_start()
                             for i, t in enumerate(tqdm(timesteps, desc=f"Sampling audio indices {left_idx}-{right_idx}", position=0)):
                                 latent_model_input = latent.to(device)
                                 timestep = torch.tensor([t]).to(device)
@@ -2353,11 +2400,14 @@ class WanVideoSampler:
                                     del callback_latent
                                 step_iteration_count += 1
                                 del latent_model_input, noise_pred
+                            speed_metrics["denoise"] += max(0.0, time.perf_counter() - framepack_denoise_t0)
 
 
                             vae.to(device)
+                            decode_t0 = time.perf_counter()
                             decode_latents = torch.cat([ref_motion.unsqueeze(0), latent.unsqueeze(0)], dim=2)
                             image = vae.decode(decode_latents.to(device, vae.dtype), device=device, pbar=False)[0]
+                            speed_metrics["decode"] += max(0.0, time.perf_counter() - decode_t0)
                             del decode_latents
                             image = image.unsqueeze(0)[:, :, -infer_frames:]
                             if r == 0:
@@ -2386,6 +2436,8 @@ class WanVideoSampler:
                             torch.cuda.reset_peak_memory_stats(device)
                         except:
                             pass
+                        _log_cache_stats_once()
+                        _log_speed_report_once(" (framepack)")
                         return {"video": gen_video_samples},
                     # region wananimate loop
                     elif wananimate_loop:
@@ -2587,6 +2639,7 @@ class WanVideoSampler:
                             gc.collect()
                             # inner WanAnimate sampling loop
                             sampling_pbar = tqdm(total=len(timesteps), desc=f"Frames {start}-{end}", position=0, leave=True)
+                            wananim_denoise_t0 = _mark_denoise_start()
                             for i in range(len(timesteps)):
                                 timestep = timesteps[i]
                                 latent_model_input = latent.to(device)
@@ -2616,6 +2669,7 @@ class WanVideoSampler:
                                         image_latent = add_noise(original_image.to(device), noise.to(device), timesteps[i+1])
                                         mask = masks[i].to(latent)
                                         latent = image_latent * mask + latent * (1-mask)
+                            speed_metrics["denoise"] += max(0.0, time.perf_counter() - wananim_denoise_t0)
 
                             del noise
                             if offload:
@@ -2623,7 +2677,9 @@ class WanVideoSampler:
                                 offloaded = True
 
                             vae.to(device)
+                            decode_t0 = time.perf_counter()
                             videos = vae.decode(latent[:, 1:].unsqueeze(0).to(device, vae.dtype), device=device, tiled=tiled_vae, pbar=False)[0].cpu()
+                            speed_metrics["decode"] += max(0.0, time.perf_counter() - decode_t0)
                             del latent
 
                             if start != 0:
@@ -2680,6 +2736,8 @@ class WanVideoSampler:
                             torch.cuda.reset_peak_memory_stats(device)
                         except:
                             pass
+                        _log_cache_stats_once()
+                        _log_speed_report_once(" (wananimate)")
                         return {"video": gen_video_samples.permute(1, 2, 3, 0), "output_path": output_path},
 
                     #region normal inference
@@ -2785,6 +2843,7 @@ class WanVideoSampler:
                         callback(idx, callback_latent.permute(1,0,2,3), None, len(timesteps))
                     else:
                         pbar.update(1)
+                speed_metrics["denoise"] += max(0.0, time.perf_counter() - denoise_t0)
 
             except Exception as e:
                 log.error(f"Error during sampling: {e}")
@@ -2824,6 +2883,8 @@ class WanVideoSampler:
             torch.cuda.reset_peak_memory_stats(device)
         except:
             pass
+        _log_cache_stats_once()
+        _log_speed_report_once()
         return ({
             "samples": latent.unsqueeze(0).cpu(),
             "looped": is_looped,

@@ -1,6 +1,7 @@
 import torch
 import os
 import gc
+import time
 from PIL import Image
 import numpy as np
 from ..latent_preview import prepare_callback
@@ -13,6 +14,7 @@ from ..HuMo.nodes import get_audio_emb_window
 import comfy.model_management as mm
 from tqdm import tqdm
 import copy
+from concurrent.futures import ThreadPoolExecutor
 
 VAE_STRIDE = (4, 8, 8)
 PATCH_SIZE = (1, 2, 2)
@@ -116,8 +118,29 @@ def multitalk_loop(self, **kwargs):
     if frame_num >= total_frames:
         arrive_last_frame = True
         estimated_iterations = 1
+    speed_report_enabled = os.environ.get("WAN_SPEED_REPORT", "1") == "1"
+    run_start_t = time.perf_counter()
+    speed_metrics = {"prep": 0.0, "denoise": 0.0, "decode": 0.0}
+
+    window_prefetch_enabled = os.environ.get("WAN_WINDOW_PREFETCH", "1") == "1"
+    prefetch_pool = ThreadPoolExecutor(max_workers=1) if window_prefetch_enabled else None
+    prefetch_future = None
+    prefetch_key = None
+    indices_cpu = indices.cpu()
+
+    def _build_center_indices_batch(start_idx, end_idx, source_lengths):
+        out = []
+        for source_len in source_lengths:
+            center_idx = torch.arange(start_idx, end_idx, audio_stride).unsqueeze(1) + indices_cpu.unsqueeze(0)
+            center_idx = torch.clamp(center_idx, min=0, max=source_len - 1)
+            out.append(center_idx)
+        return out
 
     log.info(f"Sampling {total_frames} frames in {estimated_iterations} windows, at {latent.shape[3]*vae_upscale_factor}x{latent.shape[2]*vae_upscale_factor} with {steps} steps")
+    if hasattr(transformer, "clear_runtime_caches"):
+        transformer.clear_runtime_caches(clear_cross_attn=True)
+        if hasattr(transformer, "reset_runtime_cache_stats"):
+            transformer.reset_runtime_cache_stats()
 
     while True: # start video generation iteratively
         self.cache_state = [None, None]
@@ -126,14 +149,34 @@ def multitalk_loop(self, **kwargs):
         if mode == "infinitetalk":
             cond_image = original_images[:, :, current_condframe_index:current_condframe_index+1] if cond_image is not None else None
         if multitalk_embeds is not None:
+            source_lengths = tuple(audio_embedding[i].shape[0] for i in range(human_num))
+            current_key = (audio_start_idx, audio_end_idx, source_lengths)
+            prefetched_indices = None
+            if prefetch_future is not None and prefetch_key == current_key and prefetch_future.done():
+                try:
+                    prefetched_indices = prefetch_future.result()
+                except Exception:
+                    prefetched_indices = None
+
             audio_embs = []
             # split audio with window size
             for human_idx in range(human_num):
-                center_indices = torch.arange(audio_start_idx, audio_end_idx, audio_stride).unsqueeze(1) + indices.unsqueeze(0)
-                center_indices = torch.clamp(center_indices, min=0, max=audio_embedding[human_idx].shape[0]-1)
+                if prefetched_indices is None:
+                    center_indices = torch.arange(audio_start_idx, audio_end_idx, audio_stride).unsqueeze(1) + indices.unsqueeze(0)
+                    center_indices = torch.clamp(center_indices, min=0, max=audio_embedding[human_idx].shape[0]-1)
+                else:
+                    center_indices = prefetched_indices[human_idx].to(audio_embedding[human_idx].device)
                 audio_emb = audio_embedding[human_idx][center_indices].unsqueeze(0).to(device)
                 audio_embs.append(audio_emb)
             audio_embs = torch.concat(audio_embs, dim=0).to(dtype)
+
+            if prefetch_pool is not None:
+                next_start = audio_start_idx + (frame_num - motion_frame - humo_reference_count)
+                next_end = next_start + clip_length
+                next_key = (next_start, next_end, source_lengths)
+                if prefetch_key != next_key:
+                    prefetch_future = prefetch_pool.submit(_build_center_indices_batch, next_start, next_end, source_lengths)
+                    prefetch_key = next_key
 
         h, w = (cond_image.shape[-2], cond_image.shape[-1]) if cond_image is not None else (target_h, target_w)
         lat_h, lat_w = h // VAE_STRIDE[1], w // VAE_STRIDE[2]
@@ -333,6 +376,9 @@ def multitalk_loop(self, **kwargs):
         gc.disable()
         # sampling loop
         sampling_pbar = tqdm(total=len(timesteps)-1, desc=f"Sampling audio indices {audio_start_idx}-{audio_end_idx}", position=0, leave=True)
+        if speed_metrics["prep"] == 0.0:
+            speed_metrics["prep"] = max(0.0, time.perf_counter() - run_start_t)
+        denoise_t0 = time.perf_counter()
         for i in range(len(timesteps)-1):
             timestep = timesteps[i]
             latent_model_input = latent.to(device)
@@ -382,6 +428,7 @@ def multitalk_loop(self, **kwargs):
             else:
                 if humo_image_cond is None or not is_first_clip:
                     latent[:, :cur_motion_frames_latent_num] = latent_motion_frames
+        speed_metrics["denoise"] += max(0.0, time.perf_counter() - denoise_t0)
 
         # Re-enable GC after sampling loop
         if _gc_was_enabled:
@@ -393,7 +440,9 @@ def multitalk_loop(self, **kwargs):
         if humo_image_cond is not None and humo_reference_count > 0:
             latent = latent[:,:-humo_reference_count]
         vae.to(device)
+        decode_t0 = time.perf_counter()
         videos = vae.decode(latent.unsqueeze(0).to(device, vae.dtype), device=device, tiled=tiled_vae, pbar=False)[0].cpu()
+        speed_metrics["decode"] += max(0.0, time.perf_counter() - decode_t0)
 
         vae.to(offload_device)
 
@@ -482,6 +531,23 @@ def multitalk_loop(self, **kwargs):
     if force_offload:
         if not model["auto_cpu_offload"]:
             offload_transformer(transformer)
+    if hasattr(transformer, "log_runtime_cache_stats"):
+        transformer.log_runtime_cache_stats(prefix="[Speed Opt] Cache telemetry (multitalk)")
+    if speed_report_enabled:
+        total_t = max(0.0, time.perf_counter() - run_start_t)
+        prep_t = speed_metrics["prep"]
+        denoise_t = speed_metrics["denoise"]
+        decode_t = speed_metrics["decode"]
+        if prep_t == 0.0:
+            prep_t = max(0.0, total_t - denoise_t - decode_t)
+        finalize_t = max(0.0, total_t - prep_t - denoise_t - decode_t)
+        log.info(
+            f"[Speed Opt] Speed report (multitalk): "
+            f"prep={prep_t:.3f}s, denoise={denoise_t:.3f}s, decode={decode_t:.3f}s, "
+            f"finalize={finalize_t:.3f}s, total={total_t:.3f}s"
+        )
+    if prefetch_pool is not None:
+        prefetch_pool.shutdown(wait=False, cancel_futures=True)
     try:
         print_memory(device)
         torch.cuda.reset_peak_memory_stats(device)

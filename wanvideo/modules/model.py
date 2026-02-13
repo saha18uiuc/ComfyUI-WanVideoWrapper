@@ -646,6 +646,8 @@ class WanT2VCrossAttention(WanSelfAttention):
         self.k_fusion = None
         # Cross-attention KV cache: context is static across blocks/timesteps
         self._crossattn_kv_cache = None  # (context_ptr, k_cached, v_cached)
+        self._crossattn_kv_hits = 0
+        self._crossattn_kv_misses = 0
 
     def forward(self, x, context, grid_sizes=None, clip_embed=None, audio_proj=None, audio_scale=1.0,
                 num_latent_frames=21, nag_params={}, nag_context=None, rope_func="comfy",
@@ -674,8 +676,10 @@ class WanT2VCrossAttention(WanSelfAttention):
             _cache = self._crossattn_kv_cache
             _cache_hit = (_cache is not None and _cache[0] == context.data_ptr())
             if _cache_hit:
+                self._crossattn_kv_hits += 1
                 k, v = _cache[1], _cache[2]
             else:
+                self._crossattn_kv_misses += 1
                 if is_longcat:
                     k = self.norm_k(self.k(context).to(self.norm_k.weight.dtype).view(b, -1, n, d)).to(x.dtype)
                 else:
@@ -754,6 +758,10 @@ class WanI2VCrossAttention(WanSelfAttention):
         # Cross-attention KV cache: text context and clip embed are static
         self._crossattn_kv_cache = None  # (context_ptr, k, v)
         self._crossattn_img_cache = None  # (clip_ptr, k_img, v_img)
+        self._crossattn_kv_hits = 0
+        self._crossattn_kv_misses = 0
+        self._crossattn_img_hits = 0
+        self._crossattn_img_misses = 0
 
     def forward(self, x, context, grid_sizes=None, clip_embed=None, audio_proj=None,
                 audio_scale=1.0, num_latent_frames=21, nag_params={}, nag_context=None, rope_func="comfy",
@@ -775,8 +783,10 @@ class WanI2VCrossAttention(WanSelfAttention):
             _cache = self._crossattn_kv_cache
             _cache_hit = (_cache is not None and _cache[0] == context.data_ptr())
             if _cache_hit:
+                self._crossattn_kv_hits += 1
                 k, v = _cache[1], _cache[2]
             else:
+                self._crossattn_kv_misses += 1
                 k = self.norm_k(self.k(context).to(self.norm_k.weight.dtype)).view(b, -1, n, d).to(x.dtype)
                 v = self.v(context).view(b, -1, n, d)
                 self._crossattn_kv_cache = (context.data_ptr(), k, v)
@@ -787,8 +797,10 @@ class WanI2VCrossAttention(WanSelfAttention):
             _img_cache = self._crossattn_img_cache
             _img_hit = (_img_cache is not None and _img_cache[0] == clip_embed.data_ptr())
             if _img_hit:
+                self._crossattn_img_hits += 1
                 k_img, v_img = _img_cache[1], _img_cache[2]
             else:
+                self._crossattn_img_misses += 1
                 k_img = self.norm_k_img(self.k_img(clip_embed).to(self.norm_k_img.weight.dtype)).view(b, -1, n, d).to(x.dtype)
                 v_img = self.v_img(clip_embed).view(b, -1, n, d)
                 self._crossattn_img_cache = (clip_embed.data_ptr(), k_img, v_img)
@@ -1892,6 +1904,22 @@ class WanModel(torch.nn.Module):
         self.audio_model = None
 
         self.is_longcat = is_longcat
+        # Runtime conditioning caches (exact reuse, no approximation).
+        self._cached_text_context_key = None
+        self._cached_text_context = None
+        self._cached_text_tokens = None
+        self._cached_clip_embed_key = None
+        self._cached_clip_embed = None
+        self._cached_multitalk_audio_key = None
+        self._cached_multitalk_audio = None
+        self._runtime_cache_stats = {
+            "text_hits": 0,
+            "text_misses": 0,
+            "clip_hits": 0,
+            "clip_misses": 0,
+            "audio_hits": 0,
+            "audio_misses": 0,
+        }
 
         # embeddings
         if not self.is_ovi_audio_model:
@@ -2057,6 +2085,108 @@ class WanModel(torch.nn.Module):
                 num_heads=4,
                 dtype=dtype
             )
+
+    def clear_runtime_caches(self, clear_cross_attn=False):
+        """Clear runtime caches used for exact conditioning reuse."""
+        self._cached_text_context_key = None
+        self._cached_text_context = None
+        self._cached_text_tokens = None
+        self._cached_clip_embed_key = None
+        self._cached_clip_embed = None
+        self._cached_multitalk_audio_key = None
+        self._cached_multitalk_audio = None
+        if not clear_cross_attn:
+            return
+        for block in self.blocks:
+            cross_attn = getattr(block, "cross_attn", None)
+            if cross_attn is None:
+                continue
+            if hasattr(cross_attn, "_crossattn_kv_cache"):
+                cross_attn._crossattn_kv_cache = None
+            if hasattr(cross_attn, "_crossattn_img_cache"):
+                cross_attn._crossattn_img_cache = None
+        if hasattr(self, "vace_blocks"):
+            for block in self.vace_blocks:
+                cross_attn = getattr(block, "cross_attn", None)
+                if cross_attn is None:
+                    continue
+                if hasattr(cross_attn, "_crossattn_kv_cache"):
+                    cross_attn._crossattn_kv_cache = None
+                if hasattr(cross_attn, "_crossattn_img_cache"):
+                    cross_attn._crossattn_img_cache = None
+
+    def reset_runtime_cache_stats(self):
+        self._runtime_cache_stats = {
+            "text_hits": 0,
+            "text_misses": 0,
+            "clip_hits": 0,
+            "clip_misses": 0,
+            "audio_hits": 0,
+            "audio_misses": 0,
+        }
+        for block in self.blocks:
+            cross_attn = getattr(block, "cross_attn", None)
+            if cross_attn is None:
+                continue
+            if hasattr(cross_attn, "_crossattn_kv_hits"):
+                cross_attn._crossattn_kv_hits = 0
+            if hasattr(cross_attn, "_crossattn_kv_misses"):
+                cross_attn._crossattn_kv_misses = 0
+            if hasattr(cross_attn, "_crossattn_img_hits"):
+                cross_attn._crossattn_img_hits = 0
+            if hasattr(cross_attn, "_crossattn_img_misses"):
+                cross_attn._crossattn_img_misses = 0
+        if hasattr(self, "vace_blocks"):
+            for block in self.vace_blocks:
+                cross_attn = getattr(block, "cross_attn", None)
+                if cross_attn is None:
+                    continue
+                if hasattr(cross_attn, "_crossattn_kv_hits"):
+                    cross_attn._crossattn_kv_hits = 0
+                if hasattr(cross_attn, "_crossattn_kv_misses"):
+                    cross_attn._crossattn_kv_misses = 0
+                if hasattr(cross_attn, "_crossattn_img_hits"):
+                    cross_attn._crossattn_img_hits = 0
+                if hasattr(cross_attn, "_crossattn_img_misses"):
+                    cross_attn._crossattn_img_misses = 0
+
+    def get_runtime_cache_stats(self):
+        stats = dict(self._runtime_cache_stats)
+        stats.update({
+            "cross_kv_hits": 0,
+            "cross_kv_misses": 0,
+            "cross_img_hits": 0,
+            "cross_img_misses": 0,
+        })
+        for block in self.blocks:
+            cross_attn = getattr(block, "cross_attn", None)
+            if cross_attn is None:
+                continue
+            stats["cross_kv_hits"] += int(getattr(cross_attn, "_crossattn_kv_hits", 0))
+            stats["cross_kv_misses"] += int(getattr(cross_attn, "_crossattn_kv_misses", 0))
+            stats["cross_img_hits"] += int(getattr(cross_attn, "_crossattn_img_hits", 0))
+            stats["cross_img_misses"] += int(getattr(cross_attn, "_crossattn_img_misses", 0))
+        if hasattr(self, "vace_blocks"):
+            for block in self.vace_blocks:
+                cross_attn = getattr(block, "cross_attn", None)
+                if cross_attn is None:
+                    continue
+                stats["cross_kv_hits"] += int(getattr(cross_attn, "_crossattn_kv_hits", 0))
+                stats["cross_kv_misses"] += int(getattr(cross_attn, "_crossattn_kv_misses", 0))
+                stats["cross_img_hits"] += int(getattr(cross_attn, "_crossattn_img_hits", 0))
+                stats["cross_img_misses"] += int(getattr(cross_attn, "_crossattn_img_misses", 0))
+        return stats
+
+    def log_runtime_cache_stats(self, prefix="[Speed Opt] Cache telemetry"):
+        stats = self.get_runtime_cache_stats()
+        log.info(
+            f"{prefix}: "
+            f"text(h={stats['text_hits']},m={stats['text_misses']}), "
+            f"clip(h={stats['clip_hits']},m={stats['clip_misses']}), "
+            f"audio(h={stats['audio_hits']},m={stats['audio_misses']}), "
+            f"cross_kv(h={stats['cross_kv_hits']},m={stats['cross_kv_misses']}), "
+            f"cross_img(h={stats['cross_img_hits']},m={stats['cross_img_misses']})"
+        )
 
     def block_swap(self, blocks_to_swap, offload_txt_emb=False, offload_img_emb=False, vace_blocks_to_swap=None, prefetch_blocks=0, block_swap_debug=False):
         # Clamp blocks_to_swap to valid range
@@ -2843,23 +2973,38 @@ class WanModel(torch.nn.Module):
         # clip vision embedding
         clip_embed = None
         if clip_fea is not None and hasattr(self, "img_emb"):
-            if self.offload_img_emb:
-                self.img_emb.to(self.main_device)
-            clip_embed = self.img_emb(clip_fea.to(self.main_device))  # bs x 257 x dim
-            if sdancer_input is not None:
-                clip_fea_c = sdancer_input.get("clip_fea_c", None)
+            clip_fea_c = sdancer_input.get("clip_fea_c", None) if sdancer_input is not None else None
+            lora_step_key = current_step if self.lora_scheduling_enabled else -1
+            clip_key = (
+                int(clip_fea.data_ptr()),
+                tuple(clip_fea.shape),
+                str(clip_fea.dtype),
+                int(clip_fea_c.data_ptr()) if clip_fea_c is not None else -1,
+                tuple(clip_fea_c.shape) if clip_fea_c is not None else None,
+                lora_step_key,
+            )
+            if self._cached_clip_embed_key == clip_key and self._cached_clip_embed is not None:
+                self._runtime_cache_stats["clip_hits"] += 1
+                clip_embed = self._cached_clip_embed
+            else:
+                self._runtime_cache_stats["clip_misses"] += 1
+                if self.offload_img_emb:
+                    self.img_emb.to(self.main_device)
+                clip_embed = self.img_emb(clip_fea.to(self.main_device))  # bs x 257 x dim
                 if clip_fea_c is not None:
                     clip_embed += self.img_emb(clip_fea_c.to(self.main_device))
-            if self.offload_img_emb:
-                self.img_emb.to(self.offload_device, non_blocking=self.use_non_blocking)
+                self._cached_clip_embed_key = clip_key
+                self._cached_clip_embed = clip_embed
+                if self.offload_img_emb:
+                    self.img_emb.to(self.offload_device, non_blocking=self.use_non_blocking)
 
         #context (text embedding)
         if hasattr(self, "text_embedding") and context != []:
             text_embed_dtype = self.text_embedding[0].weight.dtype
             if text_embed_dtype not in [torch.float16, torch.bfloat16, torch.float32]:
                 text_embed_dtype = self.base_dtype
-            if self.offload_txt_emb:
-                self.text_embedding.to(self.main_device)
+            context_cache_hit = False
+            context_key = None
 
             if inner_t is not None:
                 if nag_context is not None:
@@ -2874,17 +3019,40 @@ class WanModel(torch.nn.Module):
                 context_ovi = self.audio_model.text_embedding(
                     torch.stack([torch.cat([u, u.new_zeros(self.text_len - u.size(0), u.size(1))]) for u in context_ovi]).to(text_embed_dtype))
 
-            tokens = context[0].shape[0]
-            context = torch.stack([torch.cat([u, u.new_zeros(self.text_len - u.size(0), u.size(1))]) for u in context]).to(text_embed_dtype)
+            lora_step_key = current_step if self.lora_scheduling_enabled else -1
+            context_key = (
+                tuple(int(u.data_ptr()) for u in context),
+                tuple(tuple(u.shape) for u in context),
+                str(text_embed_dtype),
+                int(add_text_emb.data_ptr()) if add_text_emb is not None else -1,
+                tuple(add_text_emb.shape) if add_text_emb is not None else None,
+                lora_step_key,
+            )
+            if self._cached_text_context_key == context_key and self._cached_text_context is not None:
+                self._runtime_cache_stats["text_hits"] += 1
+                context = self._cached_text_context
+                tokens = self._cached_text_tokens
+                context_cache_hit = True
+            else:
+                self._runtime_cache_stats["text_misses"] += 1
+                if self.offload_txt_emb:
+                    self.text_embedding.to(self.main_device)
+                tokens = context[0].shape[0]
+                context = torch.stack(
+                    [torch.cat([u, u.new_zeros(self.text_len - u.size(0), u.size(1))]) for u in context]
+                ).to(text_embed_dtype)
 
-            if add_text_emb is not None:
-                self.text_projection.to(self.main_device)
-                add_text_emb = self.text_projection(add_text_emb.to(self.text_projection[0].weight.dtype)).to(text_embed_dtype)
-                context = torch.cat([add_text_emb, context], dim=1)
-            context = self.text_embedding(context)
+                if add_text_emb is not None:
+                    self.text_projection.to(self.main_device)
+                    add_text_emb = self.text_projection(add_text_emb.to(self.text_projection[0].weight.dtype)).to(text_embed_dtype)
+                    context = torch.cat([add_text_emb, context], dim=1)
+                context = self.text_embedding(context)
 
-            if self.is_longcat:
-                context[:, tokens:] = 0
+                if self.is_longcat:
+                    context[:, tokens:] = 0
+                self._cached_text_context_key = context_key
+                self._cached_text_context = context
+                self._cached_text_tokens = tokens
 
             # NAG
             if nag_context is not None:
@@ -2895,7 +3063,7 @@ class WanModel(torch.nn.Module):
                     for u in nag_context
                 ]).to(text_embed_dtype))
 
-            if self.offload_txt_emb:
+            if self.offload_txt_emb and not context_cache_hit:
                 self.text_embedding.to(self.offload_device, non_blocking=self.use_non_blocking)
 
             seq_chunks = max(context.shape[0], clip_embed.shape[0] if clip_embed is not None else 0)
@@ -2945,21 +3113,29 @@ class WanModel(torch.nn.Module):
 
         # MultiTalk
         if multitalk_audio is not None:
-            self.multitalk_audio_proj.to(self.main_device)
-            audio_cond = multitalk_audio.to(device=x.device, dtype=self.base_dtype)
-            first_frame_audio_emb_s = audio_cond[:, :1, ...] 
-            latter_frame_audio_emb = audio_cond[:, 1:, ...] 
-            latter_frame_audio_emb = rearrange(latter_frame_audio_emb, "b (n_t n) w s c -> b n_t n w s c", n=4) 
-            middle_index = self.multitalk_audio_proj.seq_len // 2
-            latter_first_frame_audio_emb = latter_frame_audio_emb[:, :, :1, :middle_index+1, ...] 
-            latter_first_frame_audio_emb = rearrange(latter_first_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c") 
-            latter_last_frame_audio_emb = latter_frame_audio_emb[:, :, -1:, middle_index:, ...] 
-            latter_last_frame_audio_emb = rearrange(latter_last_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c") 
-            latter_middle_frame_audio_emb = latter_frame_audio_emb[:, :, 1:-1, middle_index:middle_index+1, ...] 
-            latter_middle_frame_audio_emb = rearrange(latter_middle_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c") 
-            latter_frame_audio_emb_s = torch.concat([latter_first_frame_audio_emb, latter_middle_frame_audio_emb, latter_last_frame_audio_emb], dim=2) 
-            multitalk_audio_embedding = self.multitalk_audio_proj(first_frame_audio_emb_s, latter_frame_audio_emb_s)
-            self.multitalk_audio_proj.to(self.offload_device)
+            audio_key = (int(multitalk_audio.data_ptr()), tuple(multitalk_audio.shape), str(multitalk_audio.dtype))
+            if self._cached_multitalk_audio_key == audio_key and self._cached_multitalk_audio is not None:
+                self._runtime_cache_stats["audio_hits"] += 1
+                multitalk_audio_embedding = self._cached_multitalk_audio
+            else:
+                self._runtime_cache_stats["audio_misses"] += 1
+                self.multitalk_audio_proj.to(self.main_device)
+                audio_cond = multitalk_audio.to(device=x.device, dtype=self.base_dtype)
+                first_frame_audio_emb_s = audio_cond[:, :1, ...]
+                latter_frame_audio_emb = audio_cond[:, 1:, ...]
+                latter_frame_audio_emb = rearrange(latter_frame_audio_emb, "b (n_t n) w s c -> b n_t n w s c", n=4)
+                middle_index = self.multitalk_audio_proj.seq_len // 2
+                latter_first_frame_audio_emb = latter_frame_audio_emb[:, :, :1, :middle_index+1, ...]
+                latter_first_frame_audio_emb = rearrange(latter_first_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c")
+                latter_last_frame_audio_emb = latter_frame_audio_emb[:, :, -1:, middle_index:, ...]
+                latter_last_frame_audio_emb = rearrange(latter_last_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c")
+                latter_middle_frame_audio_emb = latter_frame_audio_emb[:, :, 1:-1, middle_index:middle_index+1, ...]
+                latter_middle_frame_audio_emb = rearrange(latter_middle_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c")
+                latter_frame_audio_emb_s = torch.concat([latter_first_frame_audio_emb, latter_middle_frame_audio_emb, latter_last_frame_audio_emb], dim=2)
+                multitalk_audio_embedding = self.multitalk_audio_proj(first_frame_audio_emb_s, latter_frame_audio_emb_s)
+                self.multitalk_audio_proj.to(self.offload_device)
+                self._cached_multitalk_audio_key = audio_key
+                self._cached_multitalk_audio = multitalk_audio_embedding
             human_num = len(multitalk_audio_embedding)
 
             # LongCat-Avatar specific
