@@ -146,6 +146,11 @@ def resolve_attention_mode(requested_mode="sdpa", hard_gate=True, disallow_comfy
     preferred = ["sageattn", "flash_attn_3", "flash_attn_2", "sdpa"]
 
     req = requested_mode or "sdpa"
+    if isinstance(req, str):
+        req = req.strip().lower()
+    # Backward-compatible aliases used in older workflows.
+    if req == "sageatt":
+        req = "sageattn"
     if req == "auto":
         for mode in preferred:
             if available.get(mode, False):
@@ -162,6 +167,11 @@ def resolve_attention_mode(requested_mode="sdpa", hard_gate=True, disallow_comfy
         return req
 
     if hard_gate:
+        # Keep hard-gate behavior (no comfy fallback), but don't fail on unavailable
+        # requested backend: pick the best available exact kernel.
+        for mode in preferred:
+            if available.get(mode, False):
+                return mode
         raise ValueError(f"Requested attention mode '{req}' is not available on this environment.")
 
     for mode in preferred:
